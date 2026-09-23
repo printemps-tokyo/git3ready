@@ -255,18 +255,20 @@ impl Matcher {
             // plain name; the command may be followed by a quote, bracket or
             // comment. Captures: first token, optional second name.
             branch_rename: re(
-                r#"\bbranch(?:\s+(?:-f|--force))*\s+(?:-[mM]|--move|-f[mM]|-[mM]f)(?:\s+(?:-f|--force))*\s+("[^"]*"|'[^']*'|[^\s"')\]#;]+)(?:\s+["']?([\w./][\w./-]*)["']?)?(?:[\s"')\]#;]|$)"#,
+                r#"\bbranch(?:\s+(?:-f|--force))*\s+(?:-[mM]|--move|-f[mM]|-[mM]f)(?:\s+(?:-f|--force))*\s+("[^"]*"|'[^']*'|\$\([^)]*\)|`[^`]*`|[^\s"')\]#;]+)(?:\s+["']?([\w./][\w./-]*)["']?)?(?:[\s"')\]#;]|$)"#,
             ),
             // The same in an argument list: ["branch", "-M", "master"] or
             // ["branch", "-m", "old", "master"]. The subcommand must be
             // branch: diff -M is rename detection.
             branch_rename_list: re(
-                r#"["']branch["'].*["'](?:-[mM]|--move)["']\s*,\s*(["'][^"']+["']|[\w.$]+)(?:\s*,\s*["']([^"']+)["'])?"#,
+                r#"["']branch["'].*["'](?:-[mM]|--move)["']\s*,\s*(["'][^"']+["']|[^,\]"']+)(?:\s*,\s*["']([^"']+)["'])?"#,
             ),
             command_separator: re(r"&&|\|\||;|\|"),
-            // Reading or removing the setting pins nothing.
+            // Reading or removing the setting pins nothing. Applied per
+            // command, so `git config --get ... || git config --global
+            // init.defaultBranch main` still pins through its second half.
             config_read: re(
-                r"\bconfig\b.*(?:--get\b|--get-all\b|--get-regexp\b|--unset\b|--unset-all\b|--list\b|\s-l\b|\s(?:get|unset|list)\s)",
+                r"--get\b|--get-all\b|--get-regexp\b|--unset\b|--unset-all\b|--list\b|\bconfig\s+-l\b|\bconfig(?:\s+--?[\w-]+(?:[= ]\S+)?)*\s+(?:get|unset|list)\b",
             ),
             message_subcommand: re(
                 r"\b(?:commit|merge|tag|stash|notes|revert|cherry-pick|am|branch)\b",
@@ -531,6 +533,7 @@ impl Matcher {
             let first = c
                 .get(1)
                 .map_or("", |m| m.as_str())
+                .trim()
                 .trim_matches(|ch| ch == '"' || ch == '\'');
             match c.get(2) {
                 Some(target) => target.as_str() == "master" && first != "master",
@@ -544,6 +547,17 @@ impl Matcher {
                 .branch_rename_list
                 .captures(cmd)
                 .is_some_and(renames_to_master)
+    }
+
+    /// `creates_master` for an argument list broken across lines, as in
+    /// `run(["git", "branch",` followed by `"-M", "master"])`: the previous
+    /// line, when it ends inside a list, is joined in front of this one.
+    fn creates_master_continued(&self, lines: &[&str], idx: usize, cmd: &str) -> bool {
+        let Some(prev) = idx.checked_sub(1).map(|i| lines[i].trim_end()) else {
+            return false;
+        };
+        (prev.ends_with(',') || prev.ends_with('['))
+            && self.creates_master(&format!("{prev} {}", cmd.trim()))
     }
 
     /// Report `master` references that follow an unpinned `git init` closely.
@@ -567,15 +581,20 @@ impl Matcher {
             if Self::is_comment(lines, idx) {
                 continue;
             }
-            if self.branch_pinned_file.is_match(line) && !self.config_read.is_match(line) {
+            let blanked = self.blank_messages(line);
+            if self
+                .commands(&blanked)
+                .iter()
+                .any(|(_, c)| self.branch_pinned_file.is_match(c) && !self.config_read.is_match(c))
+            {
                 return;
             }
-            let blanked = self.blank_messages(line);
             for (off, cmd) in self.commands(&blanked) {
                 if let Some(pinned) = self.init_in(cmd, lines, idx) {
                     any_init = true;
                     events.push((idx, off, pinned));
-                } else if self.creates_master(cmd) {
+                } else if self.creates_master(cmd) || self.creates_master_continued(lines, idx, cmd)
+                {
                     events.push((idx, off, true));
                 }
             }
@@ -1111,6 +1130,45 @@ mod tests {
         // An argument list broken across lines.
         assert!(has(
             "subprocess.run([\"git\",\n                \"init\"])\nsubprocess.run([\"git\", \"checkout\", \"master\"])\n",
+            "master-after-init"
+        ));
+    }
+
+    #[test]
+    fn master_after_init_round_five() {
+        // A read and a write on one line: the write still pins.
+        for text in [
+            "git config --get init.defaultBranch >/dev/null || git config --global init.defaultBranch main\ngit init r\ngit -C r checkout master\n",
+            "[ -n \"$(git config --get init.defaultBranch)\" ] || git config --global init.defaultBranch master\ngit init r\ngit -C r checkout master\n",
+            "git config --global init.defaultBranch main && git config --list | grep init\ngit init r\ngit -C r checkout master\n",
+            "git config --global init.defaultBranch main # get it right\ngit init r\ngit -C r checkout master\n",
+            "git config --global init.defaultBranch main; echo \"config set, list below\"\ngit init r\ngit -C r checkout master\n",
+        ] {
+            assert!(!has(text, "master-after-init"), "{text}");
+        }
+        // Renames from expressions.
+        for text in [
+            "git init r\ngit -C r branch -m $(git -C r branch --show-current) master\ngit -C r log master\n",
+            "git init r\ngit -C r branch -m `git -C r branch --show-current` master\ngit -C r log master\n",
+            "execFileSync('git', ['init'], { cwd });\nexecFileSync('git', ['branch', '-m', current.trim(), 'master'], { cwd });\nexecFileSync('git', ['log', 'master'], { cwd });\n",
+            "run([\"git\", \"init\"])\nrun([\"git\", \"branch\", \"-m\", cur_branch(repo), \"master\"])\nrun([\"git\", \"log\", \"master\"])\n",
+        ] {
+            assert!(!has(text, "master-after-init"), "{text}");
+        }
+    }
+
+    #[test]
+    fn list_forms_across_lines() {
+        assert!(!has(
+            "run([\"git\", \"init\"])\nrun([\"git\", \"branch\",\n     \"-M\", \"master\"])\nrun([\"git\", \"checkout\", \"master\"])\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "run([\"git\", \"init\"])\nrun([\"git\", \"checkout\",\n     \"-b\", \"master\"])\nrun([\"git\", \"log\", \"master\"])\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "git config --global init.defaultBranch master && git config --get init.defaultBranch\ngit init r\ngit -C r symbolic-ref refs/heads/master\n",
             "master-after-init"
         ));
     }

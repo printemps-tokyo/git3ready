@@ -51,13 +51,16 @@ committed into the tree.
 
 ## Install
 
-Download a binary from the
-[releases page](https://github.com/printemps-tokyo/git3ready/releases) (each
-archive has a `.sha256` next to it), or build from source:
+Build from source with a stable Rust toolchain:
 
 ```sh
 cargo install --git https://github.com/printemps-tokyo/git3ready
 ```
+
+Tagged releases attach prebuilt binaries for Linux x86_64 and macOS
+(x86_64, arm64) to the
+[releases page](https://github.com/printemps-tokyo/git3ready/releases), each
+with a `.sha256` next to it.
 
 ## Usage
 
