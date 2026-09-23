@@ -563,6 +563,20 @@ fn env_fails_when_config_or_git_dir_cannot_be_read() {
     // A global config path that is a directory: Git warns and exits 1.
     let dir_as_config = run(&[("GIT_CONFIG_GLOBAL", d.path().as_os_str())]);
     assert_eq!(dir_as_config.status.code(), Some(2), "{dir_as_config:?}");
+    // Same, when the key is found elsewhere and Git exits 0 with the warning.
+    let mut c = bin();
+    let found_anyway = c
+        .current_dir(d.path())
+        .arg("env")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", d.path())
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "init.defaultBranch")
+        .env("GIT_CONFIG_VALUE_0", "main")
+        .env_remove("GIT_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(found_anyway.status.code(), Some(2), "{found_anyway:?}");
     // GIT_DIR pointing nowhere is an error, not "no repository".
     let missing = d.path().join("nope");
     let bad_git_dir = run(&[

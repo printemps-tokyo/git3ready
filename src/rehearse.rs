@@ -145,7 +145,11 @@ pub fn plan(
         .to_ascii_lowercase();
     let warnings = aspects
         .iter()
-        .filter(|a| params.contains(&format!("'{}'", a.key.to_ascii_lowercase())))
+        // Both encodings Git accepts: 'key'='value' and the older 'key=value'.
+        .filter(|a| {
+            let key = a.key.to_ascii_lowercase();
+            params.contains(&format!("'{key}'")) || params.contains(&format!("'{key}="))
+        })
         .map(|a| {
             format!(
                 "GIT_CONFIG_PARAMETERS (from a parent git -c) sets {} and overrides the rehearsed value",
@@ -172,7 +176,8 @@ const MAX_CONFIG_COUNT: u32 = i32::MAX as u32;
 /// many entries".
 fn parse_config_count(v: &str) -> Result<u32, String> {
     let bogus = || format!("GIT_CONFIG_COUNT is set to '{v}', which Git rejects as a count");
-    let t = v.trim_start();
+    // strtoul skips C isspace() only, not Unicode spaces such as U+00A0.
+    let t = v.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     if t.is_empty() {
         return if v.is_empty() { Ok(0) } else { Err(bogus()) };
     }
@@ -347,6 +352,12 @@ mod tests {
         .unwrap();
         assert_eq!(p.warnings.len(), 1);
         assert!(p.warnings[0].contains("init.defaultBranch"));
+        let old = plan(
+            select(&[]).unwrap(),
+            env(&[("GIT_CONFIG_PARAMETERS", "'init.defaultbranch=master'")]),
+        )
+        .unwrap();
+        assert_eq!(old.warnings.len(), 1);
     }
 
     #[test]
@@ -377,7 +388,7 @@ mod tests {
         ] {
             assert_eq!(parse_config_count(v).ok(), want, "{v:?}");
         }
-        for v in ["0 ", "1x", "0x10", "-1", "2147483648", " ", "+"] {
+        for v in ["0 ", "1x", "0x10", "-1", "2147483648", " ", "+", "\u{a0}0"] {
             assert!(parse_config_count(v).is_err(), "{v:?}");
         }
         assert!(plan(

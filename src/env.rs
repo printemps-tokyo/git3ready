@@ -72,6 +72,16 @@ fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
         .map_err(|e| format!("cannot run git: {e}"))
 }
 
+/// Whether Git's stderr carries a problem report. Only `warning:`, `error:`
+/// and `fatal:` lines count; `GIT_TRACE` and friends write other lines there
+/// on every run.
+fn reports_problem(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("warning:") || l.starts_with("error:") || l.starts_with("fatal:")
+    })
+}
+
 /// Stdout of a command that is allowed to fail (rev-parse outside a repo).
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = git(cwd, args).ok()?;
@@ -96,7 +106,8 @@ fn config_all(cwd: &Path, key: &str, as_bool: bool) -> Result<Vec<Setting>, Stri
     args.extend(["--get-all", key]);
     let out = git(cwd, &args)?;
     match out.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
+        // Git can exit 0 and still warn that it skipped a config file.
+        Some(0) if !reports_problem(&out.stderr) => Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|l| l.split_once('\t'))
             .map(|(scope, value)| Setting {
@@ -104,7 +115,7 @@ fn config_all(cwd: &Path, key: &str, as_bool: bool) -> Result<Vec<Setting>, Stri
                 value: value.to_string(),
             })
             .collect()),
-        Some(1) if out.stderr.is_empty() => Ok(Vec::new()),
+        Some(1) if !reports_problem(&out.stderr) => Ok(Vec::new()),
         _ => Err(format!(
             "git config {key} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -142,7 +153,7 @@ fn comment_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
         ],
     )?;
     match out.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
+        Some(0) if !reports_problem(&out.stderr) => Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|l| {
                 let (scope, rest) = l.split_once('\t')?;
@@ -161,7 +172,7 @@ fn comment_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
                 ))
             })
             .next_back()),
-        Some(1) if out.stderr.is_empty() => Ok(None),
+        Some(1) if !reports_problem(&out.stderr) => Ok(None),
         _ => Err(format!(
             "git config core.commentChar failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
