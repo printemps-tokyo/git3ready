@@ -134,17 +134,24 @@ What a rehearsal cannot show:
 
 - Removed commands still exist in the Git you have installed.
 - A clone takes its object format from the remote, not from the default.
+- A parent `git -c key=value` (inherited through `GIT_CONFIG_PARAMETERS`,
+  which Git reads after `GIT_CONFIG_COUNT`) wins; `rehearse` warns when it
+  sees one of its keys there.
 - An explicit `git -c key=value`, an explicit option (`git init -b`,
   `--object-format`, `--ref-format`) or a test that clears the environment
   opts out. Config files do not: `GIT_CONFIG_COUNT` pairs override them.
-- `init.defaultObjectFormat` and `init.defaultRefFormat` are read from
-  configuration only since Git 2.47 (its release notes: "now they can be
+- Each setting has to be one the installed Git reads. Per Git's release
+  notes: `GIT_CONFIG_COUNT` itself arrived in 2.31, `init.defaultBranch` in
+  2.28, `safe.bareRepository` in 2.38, and `init.defaultObjectFormat` /
+  `init.defaultRefFormat` became configurable in 2.47 ("now they can be
   configured in the user's global and system wide configuration"). With an
   older Git, `rehearse` refuses to run rather than silently keep today's
-  formats; pass `--without object-format --without ref-format` to rehearse
-  the rest. The tests were run against Git 2.52.0.
+  behavior, and names the `--without` flags that would let it rehearse the
+  rest. The tests were run against Git 2.52.0.
 
 ### `git3ready env`
+
+Needs Git 2.26 or later (`git config --show-scope`).
 
 Reports how the installed Git and the current repository will behave:
 which of the defaults above are unset (and will change), which are pinned,
@@ -156,7 +163,10 @@ because Git ignores a repository's own setting for them. The two comment
 keys are one setting, so only the one Git reads last is judged. If Git's
 configuration cannot be read (a malformed file, a bad `GIT_CONFIG_COUNT`, a
 non-boolean `core.preferSymlinkRefs`), `env` stops with exit 2 instead of
-reporting settings as unset.
+reporting settings as unset. A `GIT_DEFAULT_HASH` / `GIT_DEFAULT_REF_FORMAT`
+value Git does not know (Git matches the names exactly) is reported as
+breaking `git init`; an unknown `init.default*Format` in config is reported
+as not pinning anything, since Git only warns and uses its default.
 
 ```console
 $ git3ready env
@@ -192,7 +202,7 @@ tooling.
 | `name-rev-stdin` | break | `git name-rev --stdin` in the same command (not `--annotate-stdin`, not a later command in a pipe) |
 | `grafts-file` | break | `info/grafts`, `GIT_GRAFT_FILE` |
 | `legacy-remote-dirs` | break | `.git/branches/`, `.git/remotes/` |
-| `comment-char-auto` | break | `core.commentChar` / `core.commentString` set to `auto` (lowercase, as Git compares it) |
+| `comment-char-auto` | break | `core.commentChar` / `core.commentString` set to `auto` (any case: Git compares it with `strcasecmp`) |
 | `prefer-symlink-refs` | break | `core.preferSymlinkRefs` set to true |
 | `git-source-build` | info | Git source tarballs, a clone of git/git, `NO_RUST` / `WITH_RUST` / `-Drust=` |
 

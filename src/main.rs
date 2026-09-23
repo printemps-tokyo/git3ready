@@ -235,6 +235,12 @@ fn scan(a: ScanArgs) -> Result<i32> {
             report.root_name,
             report::summary_line(&report)
         ))?;
+        if !report.stats.unreadable.is_empty() {
+            eprintln!(
+                "git3ready: could not read {} path(s); the scan is incomplete (run without -q to list them)",
+                report.stats.unreadable.len()
+            );
+        }
         eprintln!("{CAVEAT}");
     } else {
         print_flush(&report::render_text(&report, ropts))?;
@@ -267,10 +273,15 @@ fn rehearse_cmd(a: RehearseArgs) -> Result<i32> {
     match Command::new("git").arg("version").output() {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(v) = rehearse::parse_git_version(&text) {
-                if let Some(problem) = rehearse::version_problem(&aspects, v) {
-                    anyhow::bail!("{problem}");
+            match rehearse::parse_git_version(&text).filter(|_| out.status.success()) {
+                Some(v) => {
+                    if let Some(problem) = rehearse::version_problem(&aspects, v) {
+                        anyhow::bail!("{problem}");
+                    }
                 }
+                None => eprintln!(
+                    "git3ready: could not read the version from `git version`; not checking which settings it supports"
+                ),
             }
         }
         Err(_) => eprintln!("git3ready: git not found on PATH; cannot check its version"),
@@ -288,6 +299,9 @@ fn rehearse_cmd(a: RehearseArgs) -> Result<i32> {
                 plan.unset.join(", ")
             );
         }
+        for w in &plan.warnings {
+            eprintln!("git3ready: {w}");
+        }
         print_flush(&rehearse::render(&plan, format))?;
         return Ok(0);
     }
@@ -297,6 +311,9 @@ fn rehearse_cmd(a: RehearseArgs) -> Result<i32> {
     };
     if !a.quiet {
         eprintln!("{}", rehearse::banner(&plan));
+    }
+    for w in &plan.warnings {
+        eprintln!("git3ready: {w}");
     }
     let mut cmd = Command::new(program);
     cmd.args(args);

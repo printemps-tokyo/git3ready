@@ -58,6 +58,9 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
+/// The first Git with `git config --show-scope`.
+const SHOW_SCOPE_SINCE: (u32, u32) = (2, 26);
+
 /// `git <args>` in `cwd`, isolated from `GIT_CONFIG`, which would point
 /// `git config` at one file instead of the configuration Git really uses.
 fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
@@ -80,7 +83,9 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
 /// Every value of `key`, in the order Git reads them.
 ///
 /// `git config --get-all` exits 1 when the key is unset, which is an empty
-/// list here. Any other failure -- a malformed config file, a bad
+/// list here -- unless Git also printed something, which is how it reports a
+/// config file it could not read ("warning: unable to access ...") while
+/// still exiting 1. That, and any other failure -- a malformed file, a bad
 /// `GIT_CONFIG_COUNT`, a value that is not a boolean -- is an error: the
 /// check cannot be made, and saying "unset" would be wrong.
 fn config_all(cwd: &Path, key: &str, as_bool: bool) -> Result<Vec<Setting>, String> {
@@ -99,7 +104,7 @@ fn config_all(cwd: &Path, key: &str, as_bool: bool) -> Result<Vec<Setting>, Stri
                 value: value.to_string(),
             })
             .collect()),
-        Some(1) => Ok(Vec::new()),
+        Some(1) if out.stderr.is_empty() => Ok(Vec::new()),
         _ => Err(format!(
             "git config {key} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -156,7 +161,7 @@ fn comment_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
                 ))
             })
             .next_back()),
-        Some(1) => Ok(None),
+        Some(1) if out.stderr.is_empty() => Ok(None),
         _ => Err(format!(
             "git config core.commentChar failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -171,7 +176,33 @@ fn comment_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
 pub fn gather(cwd: &Path) -> Result<Facts, String> {
     let git_version = run_git(cwd, &["version"])
         .ok_or_else(|| "git is not installed or not on PATH".to_string())?;
-    let repo = run_git(cwd, &["rev-parse", "--git-common-dir"]).map(|common| {
+    // `git config --show-scope` arrived in Git 2.26 (its release notes: "git
+    // config" learned to show in which "scope" each setting comes from).
+    if let Some(v) = crate::rehearse::parse_git_version(&git_version) {
+        if v < SHOW_SCOPE_SINCE {
+            return Err(format!(
+                "git3ready env needs Git {}.{} or later (git config --show-scope); this is {git_version}",
+                SHOW_SCOPE_SINCE.0, SHOW_SCOPE_SINCE.1
+            ));
+        }
+    }
+    let explicit_git_dir = std::env::var_os("GIT_DIR").is_some_and(|v| !v.is_empty());
+    let common = git(cwd, &["rev-parse", "--git-common-dir"])?;
+    // Outside a repository rev-parse fails, and that is a normal answer. But
+    // when GIT_DIR names the repository explicitly, a failure means it is
+    // wrong, and reporting "no repository" would hide that.
+    if !common.status.success() && explicit_git_dir {
+        return Err(format!(
+            "GIT_DIR does not point at a usable repository: {}",
+            String::from_utf8_lossy(&common.stderr).trim()
+        ));
+    }
+    let common = common.status.success().then(|| {
+        String::from_utf8_lossy(&common.stdout)
+            .trim_end()
+            .to_string()
+    });
+    let repo = common.map(|common| {
         let common_dir = {
             let p = PathBuf::from(&common);
             if p.is_absolute() {
@@ -204,7 +235,7 @@ pub fn gather(cwd: &Path) -> Result<Facts, String> {
         default_ref_format: user_config(cwd, "init.defaultRefFormat")?,
         env_default_hash: std::env::var("GIT_DEFAULT_HASH").ok(),
         env_default_ref_format: std::env::var("GIT_DEFAULT_REF_FORMAT").ok(),
-        env_git_dir: std::env::var_os("GIT_DIR").is_some_and(|v| !v.is_empty()),
+        env_git_dir: explicit_git_dir,
         env_graft_file: std::env::var("GIT_GRAFT_FILE")
             .ok()
             .filter(|v| !v.is_empty()),
@@ -297,8 +328,9 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
     });
 
     if let Some((key, s)) = &f.comment {
-        // Git compares the value to "auto" exactly; "AUTO" is a literal.
-        if s.value == "auto" {
+        // Git compares the value with strcasecmp (environment.c in git/git),
+        // so AUTO is auto too.
+        if s.value.eq_ignore_ascii_case("auto") {
             out.push(Check {
                 subject: if key == "core.commentString" {
                     "core.commentString"
@@ -418,13 +450,17 @@ fn format_default(
     today: &str,
     git3: &str,
 ) -> Check {
-    if let Some((var, "")) = env {
-        return Check {
-            subject,
-            status: Some(Severity::Break),
-            detail: format!("{var} is set but empty; git init fails on an empty value"),
-            fix: Some(format!("unset {var}")),
-        };
+    // Git matches these names exactly: GIT_DEFAULT_HASH=SHA256 is "fatal:
+    // unknown hash algorithm" (observed with Git 2.52.0), and so is empty.
+    if let Some((var, v)) = env {
+        if v != today && v != git3 {
+            return Check {
+                subject,
+                status: Some(Severity::Break),
+                detail: format!("{var}={v:?} is not {today} or {git3}; git init fails with it"),
+                fix: Some(format!("unset {var}, or set it to {today} or {git3}")),
+            };
+        }
     }
     if let Some((var, v)) = env {
         return Check {
@@ -435,6 +471,17 @@ fn format_default(
         };
     }
     match setting {
+        // An unknown value in config only draws a warning and the built-in
+        // default applies (observed with Git 2.52.0), so it pins nothing.
+        Some(s) if s.value != today && s.value != git3 => Check {
+            subject,
+            status: Some(Severity::Risk),
+            detail: format!(
+                "{}, which Git does not recognize: it warns and uses its default, {today} today and {git3} under Git 3.0",
+                pinned(s)
+            ),
+            fix: Some(format!("git config --{} {subject} {today}", s.scope)),
+        },
         Some(s) => Check {
             subject,
             status: None,
@@ -615,12 +662,15 @@ mod tests {
     }
 
     #[test]
-    fn comment_value_is_case_sensitive_and_command_scope_fix_is_worded() {
+    fn comment_value_is_case_insensitive_and_command_scope_fix_is_worded() {
         let upper = Facts {
             comment: Some(("core.commentChar".into(), set("global", "AUTO").unwrap())),
             ..Default::default()
         };
-        assert_eq!(status_of(&evaluate(&upper), "core.commentChar"), None);
+        assert_eq!(
+            status_of(&evaluate(&upper), "core.commentChar"),
+            Some(Some(Severity::Break))
+        );
         let cmd = Facts {
             comment: Some(("core.commentString".into(), set("command", "auto").unwrap())),
             ..Default::default()
@@ -632,6 +682,24 @@ mod tests {
             .unwrap();
         assert_eq!(c.status, Some(Severity::Break));
         assert!(c.fix.as_deref().unwrap().contains("drop the -c"));
+    }
+
+    #[test]
+    fn unknown_format_names() {
+        let f = Facts {
+            env_default_hash: Some("SHA256".into()),
+            default_ref_format: set("global", "bogus"),
+            ..Default::default()
+        };
+        let checks = evaluate(&f);
+        assert_eq!(
+            status_of(&checks, "init.defaultObjectFormat"),
+            Some(Some(Severity::Break))
+        );
+        assert_eq!(
+            status_of(&checks, "init.defaultRefFormat"),
+            Some(Some(Severity::Risk))
+        );
     }
 
     #[test]

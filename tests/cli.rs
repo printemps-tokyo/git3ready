@@ -541,3 +541,34 @@ fn rehearse_passes_non_utf8_arguments() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"x\xff");
 }
+
+#[test]
+fn env_fails_when_config_or_git_dir_cannot_be_read() {
+    if !have_git() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let run = |envs: &[(&str, &std::ffi::OsStr)]| {
+        let mut c = bin();
+        c.current_dir(d.path())
+            .arg("env")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_DIR");
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    // A global config path that is a directory: Git warns and exits 1.
+    let dir_as_config = run(&[("GIT_CONFIG_GLOBAL", d.path().as_os_str())]);
+    assert_eq!(dir_as_config.status.code(), Some(2), "{dir_as_config:?}");
+    // GIT_DIR pointing nowhere is an error, not "no repository".
+    let missing = d.path().join("nope");
+    let bad_git_dir = run(&[
+        ("GIT_CONFIG_GLOBAL", std::ffi::OsStr::new("/dev/null")),
+        ("GIT_DIR", missing.as_os_str()),
+    ]);
+    assert_eq!(bad_git_dir.status.code(), Some(2), "{bad_git_dir:?}");
+    assert!(String::from_utf8_lossy(&bad_git_dir.stderr).contains("GIT_DIR"));
+}

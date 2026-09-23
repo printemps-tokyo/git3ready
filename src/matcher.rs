@@ -71,11 +71,14 @@ pub struct Matcher {
     object_header: Regex,
     shell_init: Regex,
     quoted_init: Regex,
+    arg_init: Regex,
     quoted_git: Regex,
     branch_pinned_line: Regex,
     branch_pinned_file: Regex,
     branch_reset: Regex,
+    branch_rename: Regex,
     command_separator: Regex,
+    message_arg: Regex,
     master: Regex,
     master_context: Regex,
     bare_cd: Regex,
@@ -151,8 +154,10 @@ impl Matcher {
             ),
             (
                 "comment-char-auto",
+                // Git compares the value with strcasecmp (environment.c), so
+                // AUTO and Auto are auto too.
                 re(
-                    r#"(?i:\bcore\.comment(?:char|string))["']?\s*(?:=|\s|,)\s*["']?auto\b|^\s*(?i:comment(?:char|string))\s*=\s*["']?auto\b"#,
+                    r#"(?i)\bcore\.comment(?:char|string)["']?\s*(?:=|\s|,)\s*["']?auto\b|^\s*comment(?:char|string)\s*=\s*["']?auto\b"#,
                 ),
             ),
             (
@@ -210,7 +215,14 @@ impl Matcher {
             shell_init: re(&format!(r"{GIT_OPTIONS}init\b")),
             // "init" as a list element (["git", "init"], .arg("init")), not
             // as a value (message="init", -m 'init').
-            quoted_init: re(r#"(?:^|[\[(,]|\barg\()\s*["']init["']"#),
+            // ["git", "init"] or ("git", ["init"]) with only Git global
+            // options in between, so ["git", "commit", "-m", "init"] is not
+            // an init.
+            quoted_init: re(
+                r#"["']git["']\s*,\s*\[?\s*(?:["'](?:-[Cc]|--git-dir|--work-tree)["']\s*,\s*(?:["'][^"']*["']|[\w.$]+)\s*,\s*|["']--?[\w-]+(?:=[^"']*)?["']\s*,\s*)*["']init["']"#,
+            ),
+            // Builder style, Command::new("git") on this or a nearby line.
+            arg_init: re(r#"\.args?\(\s*(?:&?\[\s*)?["']init["']"#),
             quoted_git: re(r#"["']git["']|\bgit\b"#),
             branch_pinned_line: re(
                 r#"(?:\s|["'])(?:-b|--initial-branch)\b|(?i:init\.defaultBranch)="#,
@@ -222,14 +234,18 @@ impl Matcher {
             // next to it is for Git versions without the option). Reading
             // the setting (--get) or mentioning it in a comment does not.
             branch_pinned_file: re(
-                r#"(?i)\bconfig\b[^\n]*\binit\.defaultBranch["']?\s+["']?[\w.-]|init\.defaultBranch=\S|GIT_CONFIG_KEY_\d+\S*\binit\.defaultBranch\b|^\s*defaultBranch\s*=|--initial-branch[= ]["']?[\w.-]"#,
+                r#"(?i)\bconfig(?:\s+--(?:global|system|local|worktree|file[= ]\S+))*\s+init\.defaultBranch\s+["']?[\w.-]|["']init\.defaultBranch["']\s*,\s*["'][\w.-]+["']|GIT_CONFIG_KEY_\d+\S*\binit\.defaultBranch\b|^\s*defaultBranch\s*=|--initial-branch[= ]["']?[\w.-]"#,
             ),
             // Renaming or creating master after init: from here on master is
             // a branch the file chose, not the default.
             branch_reset: re(
-                r#"(?:\bbranch\s+-[mM]|\bcheckout\s+-[bB]|\bswitch\s+(?:-[cC]|--create|--force-create)|\bsymbolic-ref\s+HEAD)\s+(?:refs/heads/)?master\b|["']-[mMbBcC]["']\s*,\s*["']master["']|\bsymbolic[-_]ref\b.*["']refs/heads/master["']"#,
+                r#"(?:\bcheckout\s+-[bB]|\bswitch\s+(?:-[cC]|--create|--force-create)|\bsymbolic-ref\s+HEAD)\s+(?:refs/heads/)?master(?:\s|$)|["']-[bBcC]["']\s*,\s*["']master["']|\bsymbolic[-_]ref\b.*["']refs/heads/master["']"#,
             ),
+            // git branch -m/-M [<old>] <new>: only a rename *to* master makes
+            // it, and `branch -m master main` needs master to exist.
+            branch_rename: re(r"\bbranch\s+-[mM]\s+(\S+)(?:\s+(\S+))?\s*$"),
             command_separator: re(r"&&|\|\||;|\|"),
+            message_arg: re(r#"(?:-m|--message|-F)(?:\s+|=|["']\s*,\s*)(?:"[^"]*"|'[^']*')"#),
             master: re(r"\bmaster\b"),
             master_context: re(r#"\bgit\b|refs/heads/master\b|["']master["']"#),
             bare_cd: re(
@@ -394,89 +410,151 @@ impl Matcher {
         None
     }
 
-    /// `Some(pinned)` when line `idx` runs `git init`, where `pinned` says
-    /// whether that command chooses the branch.
-    ///
-    /// For a shell command only the `git init` command itself counts: a `-b`
-    /// after `&&` belongs to another command. In code (`["git", "init"]`)
-    /// the whole line is the command.
-    fn init_on_line(&self, lines: &[&str], idx: usize) -> Option<bool> {
-        let line = lines[idx];
-        if let Some(m) = self.shell_init.find(line) {
-            let rest = &line[m.end()..];
-            let end = self
-                .command_separator
-                .find(rest)
-                .map_or(line.len(), |sep| m.end() + sep.start());
-            return Some(self.branch_pinned_line.is_match(&line[m.start()..end]));
+    /// Whether a line is a comment in the usual languages. A leading `*` is
+    /// a comment only as a doc-comment continuation (`* text`, `*/`), not a
+    /// shell `case` arm (`*) git checkout master ;;`).
+    fn is_comment(line: &str) -> bool {
+        let t = line.trim_start();
+        ["#", "//", "/*", "--", ";"]
+            .iter()
+            .any(|c| t.starts_with(c))
+            || t == "*"
+            || t.starts_with("* ")
+            || t.starts_with("*/")
+    }
+
+    /// `cmd` with every message argument replaced by spaces of equal byte
+    /// length.
+    fn blank_messages(&self, cmd: &str) -> String {
+        let mut out = cmd.to_string();
+        for m in self.message_arg.find_iter(cmd) {
+            out.replace_range(m.range(), &" ".repeat(m.len()));
         }
-        let quoted = self.quoted_init.is_match(line)
+        out
+    }
+
+    /// The commands on a line, split at `&&`, `||`, `;` and `|`, with the
+    /// byte offset each starts at.
+    fn commands<'l>(&self, line: &'l str) -> Vec<(usize, &'l str)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for sep in self.command_separator.find_iter(line) {
+            out.push((start, &line[start..sep.start()]));
+            start = sep.end();
+        }
+        out.push((start, &line[start..]));
+        out
+    }
+
+    /// `Some(pinned)` when `cmd` runs `git init`; `pinned` says whether that
+    /// command chooses the branch. `lines[idx]` is the line `cmd` is on.
+    fn init_in(&self, cmd: &str, lines: &[&str], idx: usize) -> Option<bool> {
+        if let Some(m) = self.shell_init.find(cmd) {
+            return Some(self.branch_pinned_line.is_match(&cmd[m.start()..]));
+        }
+        if self.quoted_init.is_match(cmd) {
+            return Some(self.branch_pinned_line.is_match(cmd));
+        }
+        let builder = self.arg_init.is_match(cmd)
+            && !cmd.contains("\"-m\"")
             && lines[idx.saturating_sub(2)..=idx]
                 .iter()
                 .any(|l| self.quoted_git.is_match(l));
-        quoted.then(|| self.branch_pinned_line.is_match(line))
+        builder.then(|| self.branch_pinned_line.is_match(cmd))
+    }
+
+    /// Whether `cmd` makes `master` explicitly: checkout -b / switch -c /
+    /// symbolic-ref HEAD to master, or branch -m/-M renaming something else
+    /// to master.
+    fn creates_master(&self, cmd: &str) -> bool {
+        if self.branch_reset.is_match(cmd) {
+            return true;
+        }
+        self.branch_rename.captures(cmd).is_some_and(|c| {
+            let first = c.get(1).map_or("", |m| m.as_str());
+            match c.get(2) {
+                Some(target) => target.as_str() == "master" && first != "master",
+                None => first == "master",
+            }
+        })
     }
 
     /// Report `master` references that follow an unpinned `git init` closely.
     ///
-    /// Each reference is tied to the nearest event above it (or on the same
-    /// line), within [`MASTER_WINDOW`] lines. Events are `git init` (pinned
-    /// or not) and commands that make `master` explicitly (`branch -M
-    /// master`, `checkout -b master`, `switch -c master`, `symbolic-ref HEAD
-    /// refs/heads/master`), which count as pinned. `init.defaultBranch` set
-    /// anywhere in the file pins everything. `origin/master` and other
-    /// `<remote>/master` names are skipped: the remote's branch was named
-    /// wherever the remote was created. `refs/heads/master` is kept.
+    /// Commands are ordered by position (line, then offset), so in
+    /// `git rev-parse master && git branch -M master` the reference comes
+    /// before the rename. Each reference is tied to the nearest earlier event
+    /// within [`MASTER_WINDOW`] lines: a `git init` (pinned when that command
+    /// chooses a branch) or a command that creates `master` explicitly
+    /// (pinned). Setting `init.defaultBranch` in the file (git config, a
+    /// GIT_CONFIG_KEY pair, an `[init]` line) or using `--initial-branch=`
+    /// anywhere pins everything; `-c init.defaultBranch=` only pins its own
+    /// command. Comment lines are ignored for events and references alike.
+    /// `origin/master` and other `<remote>/master` names, and names such as
+    /// `master-backup`, are not the default branch; `refs/heads/master` is.
     fn master_after_init(&self, lines: &[&str], out: &mut Vec<Finding>) {
-        let mut events: Vec<(usize, bool)> = Vec::new();
+        // (line index, byte offset, pinned)
+        let mut events: Vec<(usize, usize, bool)> = Vec::new();
         let mut any_init = false;
-        for idx in 0..lines.len() {
-            if self.branch_reset.is_match(lines[idx]) {
-                events.push((idx, true));
-            } else if let Some(pinned) = self.init_on_line(lines, idx) {
-                any_init = true;
-                events.push((idx, pinned));
-            } else if self.branch_pinned_file.is_match(lines[idx]) {
+        for (idx, line) in lines.iter().enumerate() {
+            if Self::is_comment(line) {
+                continue;
+            }
+            if self.branch_pinned_file.is_match(line) {
                 return;
+            }
+            for (off, cmd) in self.commands(line) {
+                if let Some(pinned) = self.init_in(cmd, lines, idx) {
+                    any_init = true;
+                    events.push((idx, off, pinned));
+                } else if self.creates_master(cmd) {
+                    events.push((idx, off, true));
+                }
             }
         }
         if !any_init {
             return;
         }
         for (idx, line) in lines.iter().enumerate() {
-            // Comments describe; they do not check anything out.
-            let t = line.trim_start();
-            if ["#", "//", "*", "/*", "--", ";"]
-                .iter()
-                .any(|c| t.starts_with(c))
-            {
+            if Self::is_comment(line) {
                 continue;
             }
-            let Some(m) = self.master.find_iter(line).find(|m| {
-                let before = &line[..m.start()];
-                !before.ends_with('/') || before.ends_with("refs/heads/")
-            }) else {
-                continue;
-            };
-            // A commit message that says "master" checks nothing out.
-            if !self.master_context.is_match(line) || self.message_context.is_match(line) {
-                continue;
-            }
-            let nearest = events
-                .iter()
-                .rev()
-                .find(|(i, _)| *i <= idx && idx - *i <= MASTER_WINDOW);
-            if let Some((init_idx, false)) = nearest {
-                out.push(finding(
-                    "master-after-init",
-                    idx + 1,
-                    line,
-                    m.start(),
-                    Some(format!(
-                        "git init at line {} does not choose a branch",
-                        init_idx + 1
-                    )),
-                ));
+            for (off, cmd) in self.commands(line) {
+                // Blank out message arguments (-m "merge master into dev",
+                // ["-m", "master docs"]) so their words are not references;
+                // same length, so offsets stay valid.
+                let blanked = self.blank_messages(cmd);
+                let cmd = blanked.as_str();
+                let Some(m) = self.master.find_iter(cmd).find(|m| {
+                    let before = &cmd[..m.start()];
+                    let after = &cmd[m.end()..];
+                    (!before.ends_with('/') || before.ends_with("refs/heads/"))
+                        && !after.starts_with('-')
+                }) else {
+                    continue;
+                };
+                // A commit message that says "master" checks nothing out.
+                if !self.master_context.is_match(line) || self.message_context.is_match(cmd) {
+                    continue;
+                }
+                let pos = (idx, off + m.start());
+                let nearest = events
+                    .iter()
+                    .rev()
+                    .find(|(i, o, _)| (*i, *o) <= pos && idx - *i <= MASTER_WINDOW);
+                if let Some((init_idx, _, false)) = nearest {
+                    out.push(finding(
+                        "master-after-init",
+                        idx + 1,
+                        line,
+                        off + m.start(),
+                        Some(format!(
+                            "git init at line {} does not choose a branch",
+                            init_idx + 1
+                        )),
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -802,12 +880,88 @@ mod tests {
             "git -C repo pack-redundant --i-still-use-this --all",
             "git-pack-redundant"
         ));
-        assert!(!has(
-            "git config core.commentChar AUTO",
-            "comment-char-auto"
-        ));
+        assert!(has("git config core.commentChar AUTO", "comment-char-auto"));
         assert!(has("git config CORE.COMMENTCHAR auto", "comment-char-auto"));
         assert!(has(r"/^[0-9a-f]{40}-[0-9]{24}$/", "hex40-pattern"));
+    }
+
+    #[test]
+    fn master_after_init_round_two() {
+        // Renaming master away needs master to exist: still reported.
+        assert!(has(
+            "git init r\ngit -C r branch -m master main\n",
+            "master-after-init"
+        ));
+        // master-backup is another branch; creating it does not create master.
+        assert!(has(
+            "git init r\ngit -C r checkout -b master-backup\ngit -C r log master\n",
+            "master-after-init"
+        ));
+        // Order within a line: the reference runs before the rename.
+        assert!(has(
+            "git init r\ncd r && git rev-parse master && git branch -M master\n",
+            "master-after-init"
+        ));
+        // Commented-out commands neither pin nor report.
+        assert!(has(
+            "git init r\n# git branch -M master\ngit -C r log master\n",
+            "master-after-init"
+        ));
+        assert!(has(
+            "# git config --global init.defaultBranch master\ngit init r\ngit -C r log master\n",
+            "master-after-init"
+        ));
+        // -c on another command pins only that command.
+        assert!(has(
+            "git -c init.defaultBranch=main status\ngit init r\ngit -C r log master\n",
+            "master-after-init"
+        ));
+        // A shell case arm is code, not a comment.
+        assert!(has(
+            "git init r\ncase $x in\n  *) git -C r checkout master ;;\nesac\n",
+            "master-after-init"
+        ));
+        // A commit message "init" is not an init.
+        assert!(!has(
+            "subprocess.run([\"git\", \"commit\", \"-m\", \"init\"])\nsubprocess.run([\"git\", \"checkout\", \"master\"])\n",
+            "master-after-init"
+        ));
+        assert!(has(
+            "subprocess.run([\"git\", \"-C\", d, \"init\"])\nsubprocess.run([\"git\", \"checkout\", \"master\"])\n",
+            "master-after-init"
+        ));
+        // Code that sets the default pins the file.
+        assert!(!has(
+            "run([\"git\", \"config\", \"--global\", \"init.defaultBranch\", \"master\"])\nrun([\"git\", \"init\"])\nrun([\"git\", \"checkout\", \"master\"])\n",
+            "master-after-init"
+        ));
+    }
+
+    #[test]
+    fn master_after_init_round_two_claude() {
+        // init.defaultBranch set on the init's own line pins it.
+        assert!(!has(
+            "git config --global init.defaultBranch master && git init repo\ncd repo && git checkout master\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0=master git init repo\ngit -C repo checkout master\n",
+            "master-after-init"
+        ));
+        // Message arguments are not references.
+        assert!(!has(
+            "git init repo\ngit -C repo commit -m \"merge master into dev\"\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "subprocess.run([\"git\", \"init\"])\nsubprocess.run([\"git\", \"commit\", \"-m\", \"master docs\"])\n",
+            "master-after-init"
+        ));
+        // But a reference next to a message still counts.
+        assert!(has(
+            "git init repo\ngit -C repo commit -m \"x\" && git -C repo log master\n",
+            "master-after-init"
+        ));
     }
 
     #[test]

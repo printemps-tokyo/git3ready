@@ -196,7 +196,11 @@ pub fn scan_tree(
             // An unreadable directory does not stop the walk, but it is
             // reported by path and makes the scan incomplete.
             Err(e) => {
-                stats.unreadable.push(e.to_string());
+                // Report relative to the scanned directory, like findings.
+                let root_prefix = format!("{}/", root.display());
+                stats
+                    .unreadable
+                    .push(e.to_string().replace(&root_prefix, ""));
                 continue;
             }
         };
