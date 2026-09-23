@@ -1,0 +1,42 @@
+[package]
+name = "git3ready"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Find the scripts, hooks, CI steps and code that assume Git 2.x defaults Git 3.0 changes (SHA-256 object ids, reftable, main, safe.bareRepository, removed commands), and rehearse your test suite under the new defaults. Offline Rust CLI."
+authors = ["printemps.tokyo <develop@printemps.tokyo>"]
+repository = "https://github.com/printemps-tokyo/git3ready"
+homepage = "https://github.com/printemps-tokyo/git3ready"
+readme = "README.md"
+keywords = ["git", "sha256", "reftable", "migration", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "git3ready"
+path = "src/main.rs"
+
+[lib]
+name = "git3ready"
+path = "src/lib.rs"
+
+[dependencies]
+# Error context for the thin binary layer (org convention).
+anyhow = "1"
+# Argument parsing (derive API, org convention).
+clap = { version = "4", features = ["derive"] }
+# gitignore-aware directory walk, same crate repotome, agentsdoc and sunsetscan
+# use. Its `overrides` module also supplies the glob engine for --exclude.
+ignore = "0.4"
+# The checks are patterns over shell, CI and source text. `ignore` already
+# pulls in regex-automata and regex-syntax through globset, so the front-end
+# crate costs little and replaces a lot of hand-rolled scanning.
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,11 @@
+# Files that quote git3ready's own patterns: the rule table, the matcher and
+# its tests, the environment check, and the docs that explain them. The CI
+# self-scan runs with --fail-on info, so anything new outside these fails it.
+src/lib.rs
+src/rules.rs
+src/matcher.rs
+src/env.rs
+tests/
+README.md
+AGENTS.md
+CONTRIBUTING.md

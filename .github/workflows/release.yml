@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/git3ready"
+          tar -czf "git3ready-${{ matrix.target }}.tar.gz" -C "$(dirname "$bin")" git3ready
+      # Publish a checksum next to every artifact so downloads can be verified.
+      - name: Checksums
+        shell: bash
+        run: |
+          shasum -a 256 "git3ready-${{ matrix.target }}.tar.gz" \
+            > "git3ready-${{ matrix.target }}.tar.gz.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            git3ready-${{ matrix.target }}.tar.gz
+            git3ready-${{ matrix.target }}.tar.gz.sha256
+          generate_release_notes: true
