@@ -37,7 +37,8 @@ For Git 3.0 it says, among other things:
 - `git whatchanged`, `git pack-redundant`, `git name-rev --stdin`, grafts,
   `.git/branches/` and `.git/remotes/`, `core.commentChar=auto` and
   `core.preferSymlinkRefs=true` are removed;
-- Rust becomes a required part of building Git.
+- Rust is planned to become a required part of building Git (the document
+  says this may be deferred if the impact on distributions is significant).
 
 It also says: "There is no planned release date for this breaking version
 yet." git3ready does not guess one.
@@ -85,7 +86,12 @@ Severities:
 
 To silence a line, add `git3ready:ignore` to it; name rule ids after the
 marker (`git3ready:ignore hex40-pattern`) to silence only those. Paths can go
-in a `.git3readyignore` file (gitignore syntax) or `--exclude`.
+in a `.git3readyignore` file (gitignore syntax) or `--exclude` (globs are
+relative to the scanned directory).
+
+Files that are not valid UTF-8 are still scanned, with the odd bytes
+replaced; every pattern is ASCII. Paths that cannot be read are listed, and a
+scan with unreadable paths and no failing finding exits 2, not 0.
 
 ### `git3ready rehearse -- COMMAND...`
 
@@ -113,7 +119,9 @@ set:
 they are removed from the command's environment. The exit status is the
 command's own (127 if it cannot be started).
 
-To apply the same environment in CI without wrapping each command:
+To apply the same environment in CI without wrapping each command
+(`--print env` refuses to run while `GIT_DEFAULT_HASH` or
+`GIT_DEFAULT_REF_FORMAT` is set, because `KEY=VALUE` lines cannot unset them):
 
 ```yaml
 - run: git3ready rehearse --print env >> "$GITHUB_ENV"
@@ -126,11 +134,15 @@ What a rehearsal cannot show:
 
 - Removed commands still exist in the Git you have installed.
 - A clone takes its object format from the remote, not from the default.
-- An explicit `git -c key=value` wins over the environment, and a test that
-  writes its own config file or clears the environment opts out.
-- Rehearsing the ref format needs a Git with the reftable backend, which
-  Git 2.45 introduced (`git init --ref-format=reftable`, per its release
-  notes). The tests were run against Git 2.52.0.
+- An explicit `git -c key=value`, an explicit option (`git init -b`,
+  `--object-format`, `--ref-format`) or a test that clears the environment
+  opts out. Config files do not: `GIT_CONFIG_COUNT` pairs override them.
+- `init.defaultObjectFormat` and `init.defaultRefFormat` are read from
+  configuration only since Git 2.47 (its release notes: "now they can be
+  configured in the user's global and system wide configuration"). With an
+  older Git, `rehearse` refuses to run rather than silently keep today's
+  formats; pass `--without object-format --without ref-format` to rehearse
+  the rest. The tests were run against Git 2.52.0.
 
 ### `git3ready env`
 
@@ -138,9 +150,13 @@ Reports how the installed Git and the current repository will behave:
 which of the defaults above are unset (and will change), which are pinned,
 and whether anything Git 3.0 removes is in use (`core.commentChar=auto`,
 `core.preferSymlinkRefs`, `GIT_GRAFT_FILE`, an `info/grafts` file, a
-non-empty `branches/` or `remotes/` directory). For `safe.bareRepository`
-only system, global and command-line values count, because Git ignores a
-repository's own setting for it.
+non-empty `branches/` or `remotes/` directory). For the `init.*` defaults
+and `safe.bareRepository` only system, global and command-line values count,
+because Git ignores a repository's own setting for them. The two comment
+keys are one setting, so only the one Git reads last is judged. If Git's
+configuration cannot be read (a malformed file, a bad `GIT_CONFIG_COUNT`, a
+non-boolean `core.preferSymlinkRefs`), `env` stops with exit 2 instead of
+reporting settings as unset.
 
 ```console
 $ git3ready env
@@ -163,20 +179,20 @@ tooling.
 | --- | --- | --- |
 | `hex40-pattern` | break | A hex class repeated exactly `{40}` (also `[[:xdigit:]]`, `\h`, BRE `\{40\}`), unless the same line also accepts 64 |
 | `hex40-upper-bound` | risk | `{n,40}`: abbreviations pass, full sha256 ids do not |
-| `oid-fixed-width` | risk | Length checks, slices and column widths of 40 chars / 20 bytes, on a line that names a sha, oid, commit or rev |
+| `oid-fixed-width` | risk | Length checks, slices and column widths of 40 chars / 20 bytes (`[u8; 20]`, `[20]byte`), on a line that names a sha, oid, commit or rev and not a message, subject or title |
 | `sha1-constant-oid` | break | The SHA-1 empty tree and empty blob ids, and forty zeros next to a Git-flavored word |
 | `sha1-object-hashing` | risk | A SHA-1 call within three lines of a `"blob "` / `"tree "` / `"commit "` header |
-| `ref-files-access` | break | `.git/refs/`, `packed-refs`, `.git/logs/`, also via `$GIT_DIR` and `path.join(".git", "refs")` |
-| `head-file-read` | break | `.git/HEAD` read as a file |
-| `master-after-init` | break | `master`, within 30 lines after a `git init` that does not choose a branch |
-| `embedded-bare-repo` | break | A directory in the tree that Git would treat as a bare repository |
+| `ref-files-access` | break | `.git/refs/`, `packed-refs`, `.git/logs/`, also via `$GIT_DIR`, `${GIT_DIR:-.git}`, `$(git rev-parse --git-dir)` and `path.join(gitDir, "refs")` |
+| `head-file-read` | break | `.git/HEAD` read as a file (the same prefixes; not `HEAD.lock`) |
+| `master-after-init` | break | `master` (or `refs/heads/master`), within 30 lines after a `git init` that does not choose a branch and before any `branch -M master` / `checkout -b master` / `switch -c master` |
+| `embedded-bare-repo` | risk | A directory in the tree that Git would treat as a bare repository (breaks only where Git runs inside it) |
 | `bare-repo-implicit` | risk | `cd x.git`, `git -C x.git`, `cwd: "x.git"` |
-| `git-whatchanged` | break | `git whatchanged` |
-| `git-pack-redundant` | break | `git pack-redundant` |
-| `name-rev-stdin` | break | `git name-rev --stdin` (not `--annotate-stdin`) |
+| `git-whatchanged` | break | `git whatchanged`, also after global options (`git -C repo whatchanged`) |
+| `git-pack-redundant` | break | `git pack-redundant`, likewise |
+| `name-rev-stdin` | break | `git name-rev --stdin` in the same command (not `--annotate-stdin`, not a later command in a pipe) |
 | `grafts-file` | break | `info/grafts`, `GIT_GRAFT_FILE` |
 | `legacy-remote-dirs` | break | `.git/branches/`, `.git/remotes/` |
-| `comment-char-auto` | break | `core.commentChar` / `core.commentString` set to `auto` |
+| `comment-char-auto` | break | `core.commentChar` / `core.commentString` set to `auto` (lowercase, as Git compares it) |
 | `prefer-symlink-refs` | break | `core.preferSymlinkRefs` set to true |
 | `git-source-build` | info | Git source tarballs, a clone of git/git, `NO_RUST` / `WITH_RUST` / `-Drust=` |
 
@@ -203,7 +219,9 @@ tooling.
   any other; that is what `--exclude`, `.git3readyignore` and the inline
   marker are for. In exchange it works on shell, YAML, SQL and every language
   at once.
-- `master-after-init` only sees a `git init` in the same file. A helper that
+- `master-after-init` only sees a `git init` command (shell, or `"git",
+  "init"` in an argument list) in the same file; library calls such as
+  GitPython's `Repo.init()` are not recognized. A helper that
   creates repositories in one file and a test that checks out `master` in
   another are not connected; `git3ready rehearse` is how you catch those.
 - A repository that already exists keeps its format and branch. The scan is
@@ -219,7 +237,7 @@ tooling.
 | --- | --- | --- |
 | 0 | Nothing at or above `--fail-on` (default `break`) | The command's own status |
 | 1 | At least one finding / check at or above it | |
-| 2 | Usage or I/O error | Usage error |
+| 2 | Usage or I/O error, or (`scan`) unreadable paths with no failing finding; (`env`) unreadable Git configuration | Usage error, a Git too old for the chosen aspects, or `--print env` with an overriding variable set |
 | 127 | | The command could not be started |
 
 ## License

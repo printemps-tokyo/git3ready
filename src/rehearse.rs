@@ -8,9 +8,10 @@
 //! defaults will do.
 //!
 //! What it cannot rehearse: removed commands still exist in the installed Git,
-//! a clone keeps the format of its remote, and an explicit `git -c` or a
-//! config file written by the test itself overrides the environment. The
-//! README says so.
+//! a clone keeps the format of its remote, and an explicit `git -c`, an
+//! explicit option (`git init -b`, `--object-format`) or a test that clears
+//! the environment opts out. Config files do not: `GIT_CONFIG_COUNT` pairs
+//! override them. The README says so.
 
 use std::fmt::Write as _;
 
@@ -23,7 +24,15 @@ pub struct Aspect {
     pub value: &'static str,
     /// Environment variables that would override `key` and must be cleared.
     pub overriding_env: &'static [&'static str],
+    /// The first Git release that reads `key` from configuration, when that
+    /// is recent enough to matter.
+    pub since: Option<(u32, u32)>,
 }
+
+/// Git 2.47.0's release notes: "The default object hash and ref backend
+/// format used to be settable only with explicit command line option to
+/// \"git init\" and environment variables, but now they can be configured".
+const CONFIG_DEFAULT_FORMATS: (u32, u32) = (2, 47);
 
 /// The switchable Git 3.0 defaults, in the order they are appended.
 pub const ASPECTS: &[Aspect] = &[
@@ -32,24 +41,28 @@ pub const ASPECTS: &[Aspect] = &[
         key: "init.defaultObjectFormat",
         value: "sha256",
         overriding_env: &["GIT_DEFAULT_HASH"],
+        since: Some(CONFIG_DEFAULT_FORMATS),
     },
     Aspect {
         name: "ref-format",
         key: "init.defaultRefFormat",
         value: "reftable",
         overriding_env: &["GIT_DEFAULT_REF_FORMAT"],
+        since: Some(CONFIG_DEFAULT_FORMATS),
     },
     Aspect {
         name: "default-branch",
         key: "init.defaultBranch",
         value: "main",
         overriding_env: &[],
+        since: None,
     },
     Aspect {
         name: "safe-bare-repository",
         key: "safe.bareRepository",
         value: "explicit",
         overriding_env: &[],
+        since: None,
     },
 ];
 
@@ -93,21 +106,23 @@ pub fn plan(
     aspects: Vec<&'static Aspect>,
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Plan, String> {
+    // Git treats an empty count as zero and rejects anything that is not a
+    // plain number ("bogus count in GIT_CONFIG_COUNT"), surrounding spaces
+    // included, so this does not trim either.
     let existing = match get("GIT_CONFIG_COUNT") {
         None => 0,
-        Some(v) if v.trim().is_empty() => 0,
-        Some(v) => v.trim().parse::<usize>().map_err(|_| {
-            format!(
-                "GIT_CONFIG_COUNT is set to '{v}', which is not a count; Git would reject it too"
-            )
-        })?,
+        Some(v) if v.is_empty() => 0,
+        Some(v) => v
+            .parse::<u32>()
+            .map_err(|_| format!("GIT_CONFIG_COUNT is set to '{v}', which is not a count"))?,
     };
-    let mut set = vec![(
-        "GIT_CONFIG_COUNT".to_string(),
-        (existing + aspects.len()).to_string(),
-    )];
+    let total = u32::try_from(aspects.len())
+        .ok()
+        .and_then(|n| existing.checked_add(n))
+        .ok_or_else(|| format!("GIT_CONFIG_COUNT={existing} leaves no room for more pairs"))?;
+    let mut set = vec![("GIT_CONFIG_COUNT".to_string(), total.to_string())];
     for (i, a) in aspects.iter().enumerate() {
-        let n = existing + i;
+        let n = existing as usize + i;
         set.push((format!("GIT_CONFIG_KEY_{n}"), a.key.to_string()));
         set.push((format!("GIT_CONFIG_VALUE_{n}"), a.value.to_string()));
     }
@@ -122,6 +137,39 @@ pub fn plan(
         unset,
         aspects,
     })
+}
+
+/// `(major, minor)` from `git version` output such as "git version 2.52.0"
+/// or "git version 2.39.5 (Apple Git-154)".
+pub fn parse_git_version(s: &str) -> Option<(u32, u32)> {
+    let v = s.trim().strip_prefix("git version ")?;
+    let mut parts = v.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Why the installed Git cannot rehearse some of `aspects`, if it cannot.
+pub fn version_problem(aspects: &[&'static Aspect], version: (u32, u32)) -> Option<String> {
+    let too_new: Vec<&Aspect> = aspects
+        .iter()
+        .copied()
+        .filter(|a| a.since.is_some_and(|since| version < since))
+        .collect();
+    let first = too_new.first()?;
+    let (maj, min) = first.since.unwrap_or_default();
+    let keys: Vec<&str> = too_new.iter().map(|a| a.key).collect();
+    let names: Vec<String> = too_new
+        .iter()
+        .map(|a| format!("--without {}", a.name))
+        .collect();
+    Some(format!(
+        "Git {}.{} does not read {} from configuration (added in Git {maj}.{min}), so the rehearsal would silently keep today's default; upgrade Git or pass {}",
+        version.0,
+        version.1,
+        keys.join(" / "),
+        names.join(" ")
+    ))
 }
 
 /// Output formats for `--print`.
@@ -241,6 +289,37 @@ mod tests {
         assert!(select(&["nope".into()]).is_err());
         let all: Vec<String> = ASPECTS.iter().map(|a| a.name.to_string()).collect();
         assert!(select(&all).is_err());
+    }
+
+    #[test]
+    fn count_is_parsed_like_git_does() {
+        assert!(plan(select(&[]).unwrap(), env(&[("GIT_CONFIG_COUNT", " 2 ")])).is_err());
+        assert!(plan(
+            select(&[]).unwrap(),
+            env(&[("GIT_CONFIG_COUNT", "18446744073709551615")])
+        )
+        .is_err());
+        assert!(plan(
+            select(&[]).unwrap(),
+            env(&[("GIT_CONFIG_COUNT", "4294967294")])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn versions() {
+        assert_eq!(parse_git_version("git version 2.52.0"), Some((2, 52)));
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(parse_git_version("nope"), None);
+        let all = select(&[]).unwrap();
+        assert!(version_problem(&all, (2, 47)).is_none());
+        let msg = version_problem(&all, (2, 46)).unwrap();
+        assert!(msg.contains("--without object-format --without ref-format"));
+        let rest = select(&["object-format".into(), "ref-format".into()]).unwrap();
+        assert!(version_problem(&rest, (2, 40)).is_none());
     }
 
     #[test]

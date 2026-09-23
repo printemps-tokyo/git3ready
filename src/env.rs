@@ -43,8 +43,8 @@ pub struct Facts {
     pub env_git_dir: bool,
     pub env_graft_file: Option<String>,
     pub safe_bare_repository: Option<Setting>,
-    pub comment_char: Option<Setting>,
-    pub comment_string: Option<Setting>,
+    /// The effective comment setting: which of the two names set it last.
+    pub comment: Option<(String, Setting)>,
     pub prefer_symlink_refs: Option<Setting>,
     pub repo: Option<RepoFacts>,
 }
@@ -58,52 +58,119 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
-fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+/// `git <args>` in `cwd`, isolated from `GIT_CONFIG`, which would point
+/// `git config` at one file instead of the configuration Git really uses.
+fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
         .current_dir(cwd)
         .args(args)
+        .env_remove("GIT_CONFIG")
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+        .map_err(|e| format!("cannot run git: {e}"))
 }
 
-fn config(cwd: &Path, key: &str, as_bool: bool) -> Option<Setting> {
+/// Stdout of a command that is allowed to fail (rev-parse outside a repo).
+fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = git(cwd, args).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Every value of `key`, in the order Git reads them.
+///
+/// `git config --get-all` exits 1 when the key is unset, which is an empty
+/// list here. Any other failure -- a malformed config file, a bad
+/// `GIT_CONFIG_COUNT`, a value that is not a boolean -- is an error: the
+/// check cannot be made, and saying "unset" would be wrong.
+fn config_all(cwd: &Path, key: &str, as_bool: bool) -> Result<Vec<Setting>, String> {
     let mut args = vec!["config", "--show-scope"];
     if as_bool {
         args.push("--type=bool");
     }
-    args.extend(["--get", key]);
-    let line = run_git(cwd, &args)?;
-    let (scope, value) = line.split_once('\t')?;
-    Some(Setting {
-        scope: scope.to_string(),
-        value: value.to_string(),
-    })
+    args.extend(["--get-all", key]);
+    let out = git(cwd, &args)?;
+    match out.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(scope, value)| Setting {
+                scope: scope.to_string(),
+                value: value.to_string(),
+            })
+            .collect()),
+        Some(1) => Ok(Vec::new()),
+        _ => Err(format!(
+            "git config {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
-/// Only config Git treats as protected (system, global, command line) counts
-/// for safe.bareRepository; a repository cannot vouch for itself. The last
-/// protected value wins, so every value is read and local ones are dropped.
-fn protected_config(cwd: &Path, key: &str) -> Option<Setting> {
-    let all = run_git(cwd, &["config", "--show-scope", "--get-all", key])?;
-    all.lines()
-        .filter_map(|l| l.split_once('\t'))
-        .rfind(|(scope, _)| !matches!(*scope, "local" | "worktree"))
-        .map(|(scope, value)| Setting {
-            scope: scope.to_string(),
-            value: value.to_string(),
-        })
+/// The value that applies to new repositories and to repository discovery.
+///
+/// `git init` and the `safe.*` checks ignore a repository's own config
+/// (`repository_format_configure()` and the protected-config rule in git/git
+/// `setup.c`), so local and worktree values are dropped and the last
+/// remaining value wins.
+fn user_config(cwd: &Path, key: &str) -> Result<Option<Setting>, String> {
+    Ok(config_all(cwd, key, false)?
+        .into_iter()
+        .rfind(|s| !matches!(s.scope.as_str(), "local" | "worktree")))
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+/// The last value of `key` from any scope: what a command in `cwd` uses.
+fn effective_config(cwd: &Path, key: &str, as_bool: bool) -> Result<Option<Setting>, String> {
+    Ok(config_all(cwd, key, as_bool)?.pop())
+}
+
+/// core.commentChar and core.commentString are one setting under two names;
+/// whichever Git reads last wins.
+fn comment_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
+    let out = git(
+        cwd,
+        &[
+            "config",
+            "--show-scope",
+            "--get-regexp",
+            r"^core\.comment(char|string)$",
+        ],
+    )?;
+    match out.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (scope, rest) = l.split_once('\t')?;
+                let (key, value) = rest.split_once(' ').unwrap_or((rest, ""));
+                let name = if key.eq_ignore_ascii_case("core.commentstring") {
+                    "core.commentString"
+                } else {
+                    "core.commentChar"
+                };
+                Some((
+                    name.to_string(),
+                    Setting {
+                        scope: scope.to_string(),
+                        value: value.to_string(),
+                    },
+                ))
+            })
+            .next_back()),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "git config core.commentChar failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
 /// Collect [`Facts`] by running Git in `cwd`.
-pub fn gather(cwd: &Path) -> Facts {
+///
+/// Fails when Git is missing or its configuration cannot be read; a partial
+/// answer would report settings as unset that are really unreadable.
+pub fn gather(cwd: &Path) -> Result<Facts, String> {
+    let git_version = run_git(cwd, &["version"])
+        .ok_or_else(|| "git is not installed or not on PATH".to_string())?;
     let repo = run_git(cwd, &["rev-parse", "--git-common-dir"]).map(|common| {
         let common_dir = {
             let p = PathBuf::from(&common);
@@ -130,21 +197,22 @@ pub fn gather(cwd: &Path) -> Facts {
             common_dir,
         }
     });
-    Facts {
-        git_version: run_git(cwd, &["version"]),
-        default_branch: config(cwd, "init.defaultBranch", false),
-        default_object_format: config(cwd, "init.defaultObjectFormat", false),
-        default_ref_format: config(cwd, "init.defaultRefFormat", false),
-        env_default_hash: env_nonempty("GIT_DEFAULT_HASH"),
-        env_default_ref_format: env_nonempty("GIT_DEFAULT_REF_FORMAT"),
-        env_git_dir: env_nonempty("GIT_DIR").is_some(),
-        env_graft_file: env_nonempty("GIT_GRAFT_FILE"),
-        safe_bare_repository: protected_config(cwd, "safe.bareRepository"),
-        comment_char: config(cwd, "core.commentChar", false),
-        comment_string: config(cwd, "core.commentString", false),
-        prefer_symlink_refs: config(cwd, "core.preferSymlinkRefs", true),
+    Ok(Facts {
+        git_version: Some(git_version),
+        default_branch: user_config(cwd, "init.defaultBranch")?,
+        default_object_format: user_config(cwd, "init.defaultObjectFormat")?,
+        default_ref_format: user_config(cwd, "init.defaultRefFormat")?,
+        env_default_hash: std::env::var("GIT_DEFAULT_HASH").ok(),
+        env_default_ref_format: std::env::var("GIT_DEFAULT_REF_FORMAT").ok(),
+        env_git_dir: std::env::var_os("GIT_DIR").is_some_and(|v| !v.is_empty()),
+        env_graft_file: std::env::var("GIT_GRAFT_FILE")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        safe_bare_repository: user_config(cwd, "safe.bareRepository")?,
+        comment: comment_config(cwd)?,
+        prefer_symlink_refs: effective_config(cwd, "core.preferSymlinkRefs", true)?,
         repo,
-    }
+    })
 }
 
 fn pinned(s: &Setting) -> String {
@@ -200,7 +268,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             detail: format!("{}; already the Git 3.0 behavior", pinned(s)),
             fix: None,
         },
-        Some(s) => Check {
+        Some(s) if s.value == "all" => Check {
             subject: "safe.bareRepository",
             status: None,
             detail: format!(
@@ -208,6 +276,15 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
                 pinned(s)
             ),
             fix: None,
+        },
+        Some(s) => Check {
+            subject: "safe.bareRepository",
+            status: Some(Severity::Break),
+            detail: format!(
+                "{}; Git accepts only all or explicit and fails with \"unable to parse\" when it checks a bare repository",
+                pinned(s)
+            ),
+            fix: Some("Set it to all or explicit".into()),
         },
         None => Check {
             subject: "safe.bareRepository",
@@ -219,19 +296,23 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         },
     });
 
-    for (subject, setting) in [
-        ("core.commentChar", &f.comment_char),
-        ("core.commentString", &f.comment_string),
-    ] {
-        if let Some(s) = setting {
-            if s.value.eq_ignore_ascii_case("auto") {
-                out.push(Check {
-                    subject,
-                    status: Some(Severity::Break),
-                    detail: format!("{}; the auto value is removed in Git 3.0", pinned(s)),
-                    fix: Some(format!("git config --{} {subject} ';'", scope_flag(s))),
-                });
-            }
+    if let Some((key, s)) = &f.comment {
+        // Git compares the value to "auto" exactly; "AUTO" is a literal.
+        if s.value == "auto" {
+            out.push(Check {
+                subject: if key == "core.commentString" {
+                    "core.commentString"
+                } else {
+                    "core.commentChar"
+                },
+                status: Some(Severity::Break),
+                detail: format!("{}; the auto value is removed in Git 3.0", pinned(s)),
+                fix: Some(unset_fix(
+                    s,
+                    key,
+                    &format!("git config --{{scope}} {key} ';'"),
+                )),
+            });
         }
     }
 
@@ -244,9 +325,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
                     "{}; writing symrefs as symlinks is removed in Git 3.0",
                     pinned(s)
                 ),
-                fix: Some(format!(
-                    "git config --{} --unset core.preferSymlinkRefs",
-                    scope_flag(s)
+                fix: Some(unset_fix(
+                    s,
+                    "core.preferSymlinkRefs",
+                    "git config --{scope} --unset core.preferSymlinkRefs",
                 )),
             });
         }
@@ -317,12 +399,15 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
     out
 }
 
-fn scope_flag(s: &Setting) -> &str {
+/// A fix for a setting, phrased for the scope it came from. `template` has
+/// `{scope}` where the `git config` scope flag goes.
+fn unset_fix(s: &Setting, key: &str, template: &str) -> String {
     match s.scope.as_str() {
-        "global" => "global",
-        "system" => "system",
-        "worktree" => "worktree",
-        _ => "local",
+        "global" | "system" | "local" | "worktree" => template.replace("{scope}", &s.scope),
+        "command" => format!(
+            "It comes from the command line: drop the -c {key}=... option or the GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> pair"
+        ),
+        other => format!("Change {key} where it is set ({other} scope)"),
     }
 }
 
@@ -333,6 +418,14 @@ fn format_default(
     today: &str,
     git3: &str,
 ) -> Check {
+    if let Some((var, "")) = env {
+        return Check {
+            subject,
+            status: Some(Severity::Break),
+            detail: format!("{var} is set but empty; git init fails on an empty value"),
+            fix: Some(format!("unset {var}")),
+        };
+    }
     if let Some((var, v)) = env {
         return Check {
             subject,
@@ -494,7 +587,7 @@ mod tests {
     fn removed_settings_break() {
         let f = Facts {
             default_branch: set("global", "main"),
-            comment_char: set("local", "auto"),
+            comment: Some(("core.commentChar".into(), set("local", "auto").unwrap())),
             prefer_symlink_refs: set("global", "true"),
             env_graft_file: Some("/tmp/g".into()),
             ..Default::default()
@@ -519,6 +612,44 @@ mod tests {
             .unwrap();
         assert!(fix.starts_with("git config --local"));
         assert_eq!(exit_code(&checks, Severity::Break), 1);
+    }
+
+    #[test]
+    fn comment_value_is_case_sensitive_and_command_scope_fix_is_worded() {
+        let upper = Facts {
+            comment: Some(("core.commentChar".into(), set("global", "AUTO").unwrap())),
+            ..Default::default()
+        };
+        assert_eq!(status_of(&evaluate(&upper), "core.commentChar"), None);
+        let cmd = Facts {
+            comment: Some(("core.commentString".into(), set("command", "auto").unwrap())),
+            ..Default::default()
+        };
+        let checks = evaluate(&cmd);
+        let c = checks
+            .iter()
+            .find(|c| c.subject == "core.commentString")
+            .unwrap();
+        assert_eq!(c.status, Some(Severity::Break));
+        assert!(c.fix.as_deref().unwrap().contains("drop the -c"));
+    }
+
+    #[test]
+    fn invalid_and_empty_values_break() {
+        let f = Facts {
+            safe_bare_repository: set("global", "ALL"),
+            env_default_hash: Some(String::new()),
+            ..Default::default()
+        };
+        let checks = evaluate(&f);
+        assert_eq!(
+            status_of(&checks, "safe.bareRepository"),
+            Some(Some(Severity::Break))
+        );
+        assert_eq!(
+            status_of(&checks, "init.defaultObjectFormat"),
+            Some(Some(Severity::Break))
+        );
     }
 
     #[test]

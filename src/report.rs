@@ -92,13 +92,21 @@ impl Report {
         paths.len()
     }
 
-    /// 1 when any finding is at `fail_on` or worse, otherwise 0.
+    /// 1 when any finding is at `fail_on` or worse; otherwise 2 when some
+    /// paths could not be read (the scan is incomplete, so "nothing found"
+    /// would be a claim it cannot make); otherwise 0.
     pub fn exit_code(&self, fail_on: Severity) -> i32 {
         let failing = self
             .groups
             .iter()
             .any(|(r, l)| r.severity >= fail_on && !l.is_empty());
-        i32::from(failing)
+        if failing {
+            1
+        } else if self.stats.unreadable.is_empty() {
+            0
+        } else {
+            2
+        }
     }
 }
 
@@ -187,6 +195,25 @@ pub fn render_text(report: &Report, opts: RenderOptions) -> String {
         let _ = writeln!(out);
     }
 
+    if !report.stats.unreadable.is_empty() {
+        let _ = writeln!(
+            out,
+            "{}  could not read {} path(s); the scan is incomplete:",
+            paint("ERROR", "1;31", opts),
+            report.stats.unreadable.len()
+        );
+        for p in &report.stats.unreadable {
+            let _ = writeln!(out, "  {p}");
+        }
+        let _ = writeln!(out);
+    }
+    if report.stats.lossy > 0 {
+        let _ = writeln!(
+            out,
+            "Note: {} file(s) were not valid UTF-8 and were read with replacement characters.",
+            report.stats.lossy
+        );
+    }
     let _ = writeln!(out, "Summary: {}", summary_line(report));
     let _ = writeln!(out, "{}", source_line());
     let _ = writeln!(out, "{CAVEAT}");
@@ -239,7 +266,7 @@ pub fn render_json(report: &Report) -> String {
     let rules_hit: Vec<String> = report.groups.iter().map(|(r, _)| rule_json(r)).collect();
     let s = &report.stats;
     format!(
-        "{{\"tool\":\"git3ready\",\"version\":{},\"root\":{},\"source\":{},\"caveat\":{},\"summary\":{{\"break\":{},\"risk\":{},\"info\":{},\"paths\":{},\"files_scanned\":{},\"suppressed\":{},\"skipped\":{{\"kind\":{},\"large\":{},\"binary\":{},\"unreadable\":{}}}}},\"findings\":[{}],\"rules\":[{}]}}\n",
+        "{{\"tool\":\"git3ready\",\"version\":{},\"root\":{},\"source\":{},\"caveat\":{},\"summary\":{{\"break\":{},\"risk\":{},\"info\":{},\"paths\":{},\"files_scanned\":{},\"suppressed\":{},\"lossy_utf8\":{},\"skipped\":{{\"kind\":{},\"large\":{},\"binary\":{}}},\"unreadable\":[{}]}},\"findings\":[{}],\"rules\":[{}]}}\n",
         quote(env!("CARGO_PKG_VERSION")),
         quote(&report.root_name),
         source_json(),
@@ -250,10 +277,15 @@ pub fn render_json(report: &Report) -> String {
         report.files_with_findings(),
         s.scanned,
         s.suppressed,
+        s.lossy,
         s.skipped_kind,
         s.skipped_large,
         s.skipped_binary,
-        s.skipped_unreadable,
+        s.unreadable
+            .iter()
+            .map(|p| quote(p))
+            .collect::<Vec<_>>()
+            .join(","),
         findings.join(","),
         rules_hit.join(",")
     )
@@ -345,8 +377,8 @@ mod tests {
             ids,
             vec![
                 "hex40-pattern",
-                "embedded-bare-repo",
                 "oid-fixed-width",
+                "embedded-bare-repo",
                 "git-source-build"
             ]
         );
@@ -357,8 +389,8 @@ mod tests {
     #[test]
     fn counts_and_exit_codes() {
         let r = sample();
-        assert_eq!(r.count(Severity::Break), 3);
-        assert_eq!(r.count(Severity::Risk), 1);
+        assert_eq!(r.count(Severity::Break), 2);
+        assert_eq!(r.count(Severity::Risk), 2);
         assert_eq!(r.count(Severity::Info), 1);
         assert_eq!(r.total(), 5);
         assert_eq!(r.files_with_findings(), 3);
@@ -387,6 +419,30 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_paths_make_the_scan_incomplete() {
+        let r = Report::build(
+            "r".into(),
+            vec![],
+            ScanStats {
+                unreadable: vec!["secret.sh: Permission denied".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.exit_code(Severity::Break), 2);
+        let text = render_text(&r, RenderOptions::default());
+        assert!(text.contains("could not read 1 path(s)"));
+        assert!(text.contains("secret.sh: Permission denied"));
+        assert!(render_json(&r).contains("\"unreadable\":[\"secret.sh: Permission denied\"]"));
+        // A failing finding still exits 1.
+        let both = Report::build(
+            "r".into(),
+            vec![("a".into(), vec![f("hex40-pattern", 1)])],
+            r.stats.clone(),
+        );
+        assert_eq!(both.exit_code(Severity::Break), 1);
+    }
+
+    #[test]
     fn empty_report_says_so() {
         let r = Report::build("r".into(), vec![], ScanStats::default());
         assert!(render_text(&r, RenderOptions::default()).contains("No Git 3.0 assumptions found."));
@@ -397,7 +453,7 @@ mod tests {
     fn json_has_null_lines_for_directories() {
         let json = render_json(&sample());
         assert!(json.contains("\"path\":\"fx/remote.git/\",\"line\":null,\"column\":null"));
-        assert!(json.contains("\"break\":3"));
+        assert!(json.contains("\"break\":2"));
         let parsed = crate::json::parse(&json).expect("valid json");
         assert!(parsed.get("findings").is_some());
     }

@@ -64,6 +64,7 @@ pub struct Matcher {
     width: Regex,
     hash_context: Regex,
     hash_context_camel: Regex,
+    message_context: Regex,
     constant_oid: Regex,
     null_oid_context: Regex,
     sha1_call: Regex,
@@ -73,13 +74,27 @@ pub struct Matcher {
     quoted_git: Regex,
     branch_pinned_line: Regex,
     branch_pinned_file: Regex,
+    branch_reset: Regex,
+    command_separator: Regex,
     master: Regex,
     master_context: Regex,
     bare_cd: Regex,
 }
 
 /// `.git`, `$GIT_DIR` or `$GIT_COMMON_DIR` followed by a path separator.
-const GIT_DIR_PREFIX: &str = r"(?:\.git|\$\{?GIT_DIR\}?|\$\{?GIT_COMMON_DIR\}?)[/\\]";
+///
+/// Also `${GIT_DIR:-.git}` and `$(git rev-parse --git-dir)` (and the
+/// `--git-common-dir` / `--absolute-git-dir` forms), which hooks use to find
+/// the repository.
+const GIT_DIR_PREFIX: &str = r#"(?:\.git|\$\{?GIT_DIR\}?|\$\{?GIT_COMMON_DIR\}?|\$\{GIT_(?:COMMON_)?DIR:-[^}]*\}|\$\(git\s+rev-parse\s+--(?:absolute-)?git-(?:common-)?dir\))["']?[/\\]"#;
+
+/// `git` plus any global options before the subcommand (`-C dir`, `-c k=v`,
+/// `--git-dir=...`, `--no-pager`), then whitespace.
+const GIT_OPTIONS: &str = r"\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+";
+
+/// A variable holding the Git directory, joined with a path component in
+/// code: `path.join(gitDir, "refs")`, `os.path.join(git_dir, "HEAD")`.
+const GIT_DIR_JOIN: &str = r#"(?:["']\.git["']|(?i:\bgit_?dir)\w*)\s*,\s*"#;
 
 fn re(pattern: &str) -> Regex {
     // Patterns are compile-time constants covered by tests; a failure here is
@@ -100,26 +115,35 @@ impl Matcher {
             (
                 "ref-files-access",
                 re(&format!(
-                    r#"{GIT_DIR_PREFIX}(?:refs\b|packed-refs\b|logs[/\\])|\bpacked-refs\b|["']\.git["']\s*,\s*["'](?:refs|packed-refs|logs)["']"#
+                    r#"{GIT_DIR_PREFIX}(?:refs\b|packed-refs\b|logs[/\\])|\bpacked-refs\b|{GIT_DIR_JOIN}["'](?:refs|packed-refs|logs)["']"#
                 )),
             ),
             (
                 "head-file-read",
                 re(&format!(
-                    r#"{GIT_DIR_PREFIX}HEAD\b|["']\.git["']\s*,\s*["']HEAD["']"#
+                    // `HEAD.lock` is Git's lock file, not the HEAD file.
+                    r#"{GIT_DIR_PREFIX}HEAD(?:[^\w.]|$)|{GIT_DIR_JOIN}["']HEAD["']"#
                 )),
             ),
             (
                 "git-whatchanged",
-                re(r#"\bgit[\s-]+whatchanged\b|["']whatchanged["']"#),
+                re(&format!(
+                    r#"{GIT_OPTIONS}whatchanged\b|\bgit-whatchanged\b|["']whatchanged["']"#
+                )),
             ),
             (
                 "git-pack-redundant",
-                re(r#"\bgit[\s-]+pack-redundant\b|["']pack-redundant["']"#),
+                re(&format!(
+                    r#"{GIT_OPTIONS}pack-redundant\b|\bgit-pack-redundant\b|["']pack-redundant["']"#
+                )),
             ),
-            // The option must be preceded by whitespace or a quote, which is
-            // what keeps --annotate-stdin out.
-            ("name-rev-stdin", re(r#"\bname-rev\b.*[\s"']--stdin\b"#)),
+            // The option must be preceded by whitespace or a quote, which keeps
+            // --annotate-stdin out, and belong to the same command, which
+            // keeps `git name-rev ... | git hash-object --stdin` out.
+            (
+                "name-rev-stdin",
+                re(r#"\bname-rev\b[^|;&\n]*[\s"']--stdin\b"#),
+            ),
             ("grafts-file", re(r"\binfo[/\\]grafts\b|\bGIT_GRAFT_FILE\b")),
             (
                 "legacy-remote-dirs",
@@ -128,7 +152,7 @@ impl Matcher {
             (
                 "comment-char-auto",
                 re(
-                    r#"(?i)\bcore\.comment(?:char|string)["']?\s*(?:=|\s|,)\s*["']?auto\b|^\s*comment(?:char|string)\s*=\s*["']?auto\b"#,
+                    r#"(?i:\bcore\.comment(?:char|string))["']?\s*(?:=|\s|,)\s*["']?auto\b|^\s*(?i:comment(?:char|string))\s*=\s*["']?auto\b"#,
                 ),
             ),
             (
@@ -157,15 +181,20 @@ impl Matcher {
             // suffix of a 40-or-64 pattern. A line that has one already
             // handles both lengths.
             hex64: re(
-                r"(?:\[\[:xdigit:\]\]|\[(?:\\d|[0-9a-zA-Z-])+\]|\\h|\\p\{(?:XDigit|AHex|Hex_Digit|ASCII_Hex_Digit)\})\\?\{(?:\d+,)?(?:64|24)\\?\}",
+                r"(?:\[\[:xdigit:\]\]|\[((?:\\d|[0-9a-zA-Z-])+)\]|\\h|\\p\{(?:XDigit|AHex|Hex_Digit|ASCII_Hex_Digit)\})\\?\{(?:\d+,)?(?:64|24)\\?\}",
             ),
             width: re(
-                r#"(?i)(?:\blen\([^()]*\)|\.length\b|\.len\(\)|\.size\(\)|\b(?:mb_)?strlen\([^()]*\)|\$\{#\w+\}["']?|\bcount\([^()]*\))\s*(?:={2,3}|!==?|<=?|>=?|-(?:eq|ne|lt|le|gt|ge)\b)\s*40\b|\[\s*(?:0\s*)?:\s*40\s*\]|\[\s*\.\.\s*40\s*\]|\.(?:slice|substring|substr)\(\s*0\s*,\s*40\s*\)|\bsubstr\([^,()]+,\s*0\s*,\s*40\s*\)|\bcut\s+-c\s*1?-40\b|\bhead\s+-c\s*40\b|\b(?:var)?char\s*\(\s*40\s*\)|\b(?:var)?binary\s*\(\s*20\s*\)|\[u8;\s*20\]"#,
+                r#"(?i)(?:\blen\([^()]*\)|\.length\b|\.len\(\)|\.size\b(?:\(\))?|\b(?:mb_)?strlen\([^()]*\)|\$\{#\w+\}["']?|\bcount\([^()]*\))\s*(?:={2,3}|!==?|<=?|>=?|-(?:eq|ne|lt|le|gt|ge)\b)\s*40\b|\[\s*(?:0\s*)?:\s*40\s*\]|\[\s*\.\.\s*40\s*\]|\.(?:slice|substring|substr)\(\s*0\s*,\s*40\s*\)|\bsubstr\([^,()]+,\s*0\s*,\s*40\s*\)|\bcut\s+-c\s*1?-40\b|\bhead\s+-c\s*40\b|\b(?:var)?char\s*\(\s*40\s*\)|\b(?:var)?binary\s*\(\s*20\s*\)|\[u8;\s*20\]|\[20\]byte\b|\.length\(\s*40\s*\)"#,
             ),
             hash_context: re(
                 r"(?i)(?:\b|_)(?:sha1?|hexsha|oids?|objectid|object_id|commit\w*|revs?|revision)(?:\b|_)",
             ),
             hash_context_camel: re(r"[a-z](?:Sha1?|Oid|ObjectId|Commit)\b"),
+            // Commit messages are cut to 40 characters for display all the
+            // time; that is not an object id.
+            message_context: re(
+                r"(?i)(?:\b|_)(?:message|msg|subject|summary|title|description|body)(?:\b|_)",
+            ),
             constant_oid: re(
                 r"\b(?:4b825dc642cb6eb9a060e54bf8d69288fbee4904|e69de29bb2d1d6434b8b29ae775ad8c2e48c5391|0{40})\b",
             ),
@@ -178,11 +207,29 @@ impl Matcher {
                 r#"(?i)hashlib\.sha1\b|createHash\(\s*['"]sha-?1['"]|\bsha1\s*\(|\bsha1::|\bsha1sum\b|\bdigest::sha1\b|\bopenssl\s+(?:dgst\s+-)?sha1\b|getInstance\(\s*"sha-?1"|\bsha1\.new\b|\bcrypto/sha1\b|\bsha1\.sum\b"#,
             ),
             object_header: re(r#"(?:\bb)?["'`](?:blob|tree|commit|tag) "#),
-            shell_init: re(r"\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+init\b"),
-            quoted_init: re(r#"["']init["']"#),
+            shell_init: re(&format!(r"{GIT_OPTIONS}init\b")),
+            // "init" as a list element (["git", "init"], .arg("init")), not
+            // as a value (message="init", -m 'init').
+            quoted_init: re(r#"(?:^|[\[(,]|\barg\()\s*["']init["']"#),
             quoted_git: re(r#"["']git["']|\bgit\b"#),
-            branch_pinned_line: re(r#"(?:\s|["'])(?:-b|--initial-branch)\b"#),
-            branch_pinned_file: re(r"(?i)\binit\.defaultBranch\b|--initial-branch\b"),
+            branch_pinned_line: re(
+                r#"(?:\s|["'])(?:-b|--initial-branch)\b|(?i:init\.defaultBranch)="#,
+            ),
+            // Setting the default for the whole file: git config ...
+            // init.defaultBranch <value>, a GIT_CONFIG_KEY_<n> pair, an
+            // [init] section line, or --initial-branch=<name> used anywhere
+            // (the file already names its branches; a bare fallback init
+            // next to it is for Git versions without the option). Reading
+            // the setting (--get) or mentioning it in a comment does not.
+            branch_pinned_file: re(
+                r#"(?i)\bconfig\b[^\n]*\binit\.defaultBranch["']?\s+["']?[\w.-]|init\.defaultBranch=\S|GIT_CONFIG_KEY_\d+\S*\binit\.defaultBranch\b|^\s*defaultBranch\s*=|--initial-branch[= ]["']?[\w.-]"#,
+            ),
+            // Renaming or creating master after init: from here on master is
+            // a branch the file chose, not the default.
+            branch_reset: re(
+                r#"(?:\bbranch\s+-[mM]|\bcheckout\s+-[bB]|\bswitch\s+(?:-[cC]|--create|--force-create)|\bsymbolic-ref\s+HEAD)\s+(?:refs/heads/)?master\b|["']-[mMbBcC]["']\s*,\s*["']master["']|\bsymbolic[-_]ref\b.*["']refs/heads/master["']"#,
+            ),
+            command_separator: re(r"&&|\|\||;|\|"),
             master: re(r"\bmaster\b"),
             master_context: re(r#"\bgit\b|refs/heads/master\b|["']master["']"#),
             bare_cd: re(
@@ -291,7 +338,14 @@ impl Matcher {
     }
 
     fn hex_patterns(&self, lineno: usize, line: &str, out: &mut Vec<Finding>) {
-        if self.hex64.is_match(line) {
+        // Only a hex class sized 64 (or the {24} tail of 40+24) counts as
+        // handling sha256; `[0-9]{24}` next to a 40 does not.
+        let handles_64 = self.hex64.captures_iter(line).any(|c| {
+            c.get(1).is_none_or(|class| {
+                class.as_str().contains("a-f") || class.as_str().contains("A-F")
+            })
+        });
+        if handles_64 {
             return;
         }
         for caps in self.hex_class.captures_iter(line) {
@@ -316,7 +370,9 @@ impl Matcher {
         let Some(m) = self.width.find(line) else {
             return;
         };
-        if self.hash_context.is_match(line) || self.hash_context_camel.is_match(line) {
+        if (self.hash_context.is_match(line) || self.hash_context_camel.is_match(line))
+            && !self.message_context.is_match(line)
+        {
             out.push(finding("oid-fixed-width", lineno, line, m.start(), None));
         }
     }
@@ -338,55 +394,75 @@ impl Matcher {
         None
     }
 
-    fn is_init_line(&self, lines: &[&str], idx: usize) -> bool {
+    /// `Some(pinned)` when line `idx` runs `git init`, where `pinned` says
+    /// whether that command chooses the branch.
+    ///
+    /// For a shell command only the `git init` command itself counts: a `-b`
+    /// after `&&` belongs to another command. In code (`["git", "init"]`)
+    /// the whole line is the command.
+    fn init_on_line(&self, lines: &[&str], idx: usize) -> Option<bool> {
         let line = lines[idx];
-        self.shell_init.is_match(line)
-            || (self.quoted_init.is_match(line)
-                && lines[idx.saturating_sub(2)..=idx]
-                    .iter()
-                    .any(|l| self.quoted_git.is_match(l)))
+        if let Some(m) = self.shell_init.find(line) {
+            let rest = &line[m.end()..];
+            let end = self
+                .command_separator
+                .find(rest)
+                .map_or(line.len(), |sep| m.end() + sep.start());
+            return Some(self.branch_pinned_line.is_match(&line[m.start()..end]));
+        }
+        let quoted = self.quoted_init.is_match(line)
+            && lines[idx.saturating_sub(2)..=idx]
+                .iter()
+                .any(|l| self.quoted_git.is_match(l));
+        quoted.then(|| self.branch_pinned_line.is_match(line))
     }
 
     /// Report `master` references that follow an unpinned `git init` closely.
     ///
-    /// Each reference is tied to the nearest `git init` above it (or on the
-    /// same line), within [`MASTER_WINDOW`] lines. A branch chosen on that
-    /// init line (`-b`, `--initial-branch`, `-c init.defaultBranch=`) pins it;
-    /// `init.defaultBranch` set anywhere else in the file pins every init.
-    /// `origin/master` and other `<remote>/master` names are skipped: the
-    /// remote's branch was named wherever the remote was created.
+    /// Each reference is tied to the nearest event above it (or on the same
+    /// line), within [`MASTER_WINDOW`] lines. Events are `git init` (pinned
+    /// or not) and commands that make `master` explicitly (`branch -M
+    /// master`, `checkout -b master`, `switch -c master`, `symbolic-ref HEAD
+    /// refs/heads/master`), which count as pinned. `init.defaultBranch` set
+    /// anywhere in the file pins everything. `origin/master` and other
+    /// `<remote>/master` names are skipped: the remote's branch was named
+    /// wherever the remote was created. `refs/heads/master` is kept.
     fn master_after_init(&self, lines: &[&str], out: &mut Vec<Finding>) {
-        let inits: Vec<(usize, bool)> = (0..lines.len())
-            .filter(|&i| self.is_init_line(lines, i))
-            .map(|i| {
-                let l = lines[i];
-                (
-                    i,
-                    self.branch_pinned_line.is_match(l) || self.branch_pinned_file.is_match(l),
-                )
-            })
-            .collect();
-        if inits.is_empty() {
-            return;
+        let mut events: Vec<(usize, bool)> = Vec::new();
+        let mut any_init = false;
+        for idx in 0..lines.len() {
+            if self.branch_reset.is_match(lines[idx]) {
+                events.push((idx, true));
+            } else if let Some(pinned) = self.init_on_line(lines, idx) {
+                any_init = true;
+                events.push((idx, pinned));
+            } else if self.branch_pinned_file.is_match(lines[idx]) {
+                return;
+            }
         }
-        let pinned_elsewhere = lines.iter().enumerate().any(|(i, l)| {
-            self.branch_pinned_file.is_match(l) && !inits.iter().any(|(j, _)| *j == i)
-        });
-        if pinned_elsewhere {
+        if !any_init {
             return;
         }
         for (idx, line) in lines.iter().enumerate() {
-            let Some(m) = self
-                .master
-                .find_iter(line)
-                .find(|m| !line[..m.start()].ends_with('/'))
-            else {
-                continue;
-            };
-            if !self.master_context.is_match(line) {
+            // Comments describe; they do not check anything out.
+            let t = line.trim_start();
+            if ["#", "//", "*", "/*", "--", ";"]
+                .iter()
+                .any(|c| t.starts_with(c))
+            {
                 continue;
             }
-            let nearest = inits
+            let Some(m) = self.master.find_iter(line).find(|m| {
+                let before = &line[..m.start()];
+                !before.ends_with('/') || before.ends_with("refs/heads/")
+            }) else {
+                continue;
+            };
+            // A commit message that says "master" checks nothing out.
+            if !self.master_context.is_match(line) || self.message_context.is_match(line) {
+                continue;
+            }
+            let nearest = events
                 .iter()
                 .rev()
                 .find(|(i, _)| *i <= idx && idx - *i <= MASTER_WINDOW);
@@ -638,6 +714,100 @@ mod tests {
             "git checkout master\ngit init r\n",
             "master-after-init"
         ));
+    }
+
+    #[test]
+    fn master_after_init_resets_and_full_names() {
+        // Renaming or creating master makes it an explicit choice.
+        assert!(!has(
+            "git init\ngit add .\ngit commit -m x\ngit branch -M master\ngit push -u origin master\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "git init repo\ngit -C repo checkout -b master\ngit -C repo log master\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "git init repo\ngit -C repo symbolic-ref HEAD refs/heads/master\ngit -C repo log master\n",
+            "master-after-init"
+        ));
+        // The full local name is still the default branch.
+        assert!(has(
+            "git init repo\ngit -C repo rev-parse --verify refs/heads/master\n",
+            "master-after-init"
+        ));
+        // A -b for another command after && does not pin the init.
+        assert!(has(
+            "git init -q r && git -C r checkout -b topic\ngit -C r merge master\n",
+            "master-after-init"
+        ));
+        // A fallback init next to one that uses --initial-branch, and doc
+        // comments that mention master, are not reported.
+        assert!(!has(
+            "const args = [\"--initial-branch=master\"];\nexeca(\"git\", [\"init\", ...args]).catch(() => execa(\"git\", [\"init\"]));\nfunction repo(branch = \"master\") {}\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "git init r\n# then git checkout master\n",
+            "master-after-init"
+        ));
+        // message="init" is a commit message, not an init.
+        assert!(!has(
+            "r.git.commit(message=\"init\")\nr.git.checkout(\"master\")\n",
+            "master-after-init"
+        ));
+        // Library calls (GitPython Repo.init and friends) are not treated
+        // as git init: their master references are too often remote
+        // branches or explicit create_head calls. The README says so.
+        assert!(!has(
+            "r = Repo.init(rw_dir)\nr.git.cherry_pick(\"master\")\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "r = Repo.init(d)\nr.git.commit(message=\"change on master\")\n",
+            "master-after-init"
+        ));
+        // Reading the setting, or naming it in a comment, pins nothing.
+        assert!(has(
+            "# see git config --get init.defaultBranch\ngit init r\ngit -C r checkout master\n",
+            "master-after-init"
+        ));
+    }
+
+    #[test]
+    fn precision_fixes_from_review() {
+        assert!(!has("print(commit.message[:40])", "oid-fixed-width"));
+        assert!(!has("if len(commit_message) > 40:", "oid-fixed-width"));
+        assert!(has("type ObjectID [20]byte", "oid-fixed-width"));
+        assert!(has("raise unless sha.size == 40", "oid-fixed-width"));
+        assert!(has(
+            r#"ls "$(git rev-parse --git-dir)/refs/heads""#,
+            "ref-files-access"
+        ));
+        assert!(has(r#"cat "${GIT_DIR:-.git}/HEAD""#, "head-file-read"));
+        assert!(has(
+            r#"open(os.path.join(git_dir, "HEAD"))"#,
+            "head-file-read"
+        ));
+        assert!(!has("rm -f .git/HEAD.lock", "head-file-read"));
+        assert!(!has(
+            "git name-rev --name-only HEAD | git hash-object --stdin",
+            "name-rev-stdin"
+        ));
+        assert!(has(
+            "git -C repo whatchanged --i-still-use-this",
+            "git-whatchanged"
+        ));
+        assert!(has(
+            "git -C repo pack-redundant --i-still-use-this --all",
+            "git-pack-redundant"
+        ));
+        assert!(!has(
+            "git config core.commentChar AUTO",
+            "comment-char-auto"
+        ));
+        assert!(has("git config CORE.COMMENTCHAR auto", "comment-char-auto"));
+        assert!(has(r"/^[0-9a-f]{40}-[0-9]{24}$/", "hex40-pattern"));
     }
 
     #[test]

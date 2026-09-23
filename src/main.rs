@@ -1,5 +1,6 @@
 //! Command-line entry point for git3ready.
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
@@ -141,8 +142,8 @@ struct RehearseArgs {
     quiet: bool,
 
     /// The command to run, after `--`.
-    #[arg(last = true, value_name = "COMMAND")]
-    command: Vec<String>,
+    #[arg(last = true, value_name = "COMMAND", value_parser = clap::value_parser!(OsString))]
+    command: Vec<OsString>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -245,10 +246,7 @@ fn env_cmd(a: EnvArgs) -> Result<i32> {
     if !a.dir.is_dir() {
         anyhow::bail!("not a directory: {}", a.dir.display());
     }
-    let facts = env::gather(&a.dir);
-    if facts.git_version.is_none() {
-        anyhow::bail!("git is not installed or not on PATH");
-    }
+    let facts = env::gather(&a.dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     let checks = env::evaluate(&facts);
     if a.json {
         print_flush(&env::render_json(&facts, &checks))?;
@@ -264,13 +262,29 @@ fn env_cmd(a: EnvArgs) -> Result<i32> {
 
 fn rehearse_cmd(a: RehearseArgs) -> Result<i32> {
     let aspects = rehearse::select(&a.without).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Ask the Git on PATH whether it reads the keys being injected. When there
+    // is no Git here (a --print for another machine), say so and go on.
+    match Command::new("git").arg("version").output() {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(v) = rehearse::parse_git_version(&text) {
+                if let Some(problem) = rehearse::version_problem(&aspects, v) {
+                    anyhow::bail!("{problem}");
+                }
+            }
+        }
+        Err(_) => eprintln!("git3ready: git not found on PATH; cannot check its version"),
+    }
+
     let plan =
         rehearse::plan(aspects, |k| std::env::var(k).ok()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if let Some(format) = a.print {
         if format == PrintFormat::Env && !plan.unset.is_empty() {
-            eprintln!(
-                "git3ready: {} is set and overrides the rehearsal; unset it in that environment",
+            // KEY=VALUE lines cannot unset anything, so the rehearsal would
+            // be silently overridden. Refuse rather than print a half plan.
+            anyhow::bail!(
+                "{} is set and would override the rehearsal; unset it in that environment, or use --print sh",
                 plan.unset.join(", ")
             );
         }
@@ -295,7 +309,7 @@ fn rehearse_cmd(a: RehearseArgs) -> Result<i32> {
     let status = match cmd.status() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("git3ready: cannot run {program}: {e}");
+            eprintln!("git3ready: cannot run {}: {e}", program.to_string_lossy());
             return Ok(127);
         }
     };

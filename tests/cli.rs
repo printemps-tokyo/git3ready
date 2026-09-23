@@ -272,7 +272,7 @@ fn rules_listing() {
 
 #[test]
 fn rehearse_switches_on_the_new_defaults() {
-    if !have_git() {
+    if !git_at_least(2, 47) {
         return;
     }
     let d = tempfile::tempdir().unwrap();
@@ -303,7 +303,7 @@ fn rehearse_switches_on_the_new_defaults() {
 
 #[test]
 fn rehearse_refuses_implicit_bare_discovery() {
-    if !have_git() {
+    if !git_at_least(2, 47) {
         return;
     }
     let d = tempfile::tempdir().unwrap();
@@ -334,6 +334,9 @@ fn rehearse_refuses_implicit_bare_discovery() {
 
 #[test]
 fn rehearse_passes_exit_status_through() {
+    if !git_at_least(2, 47) {
+        return;
+    }
     let three = bin()
         .args(["rehearse", "-q", "--", "sh", "-c", "exit 3"])
         .output()
@@ -350,6 +353,9 @@ fn rehearse_passes_exit_status_through() {
 
 #[test]
 fn rehearse_print_formats() {
+    if !git_at_least(2, 47) {
+        return;
+    }
     let sh = bin()
         .args(["rehearse", "--print", "sh"])
         .env_remove("GIT_CONFIG_COUNT")
@@ -405,4 +411,133 @@ fn env_reports_removed_settings() {
     };
     assert_eq!(status("core.commentChar").as_deref(), Some("break"));
     assert_eq!(status("init.defaultBranch").as_deref(), Some("ok"));
+}
+
+fn git_at_least(major: u32, minor: u32) -> bool {
+    let Ok(out) = Command::new("git").arg("version").output() else {
+        return false;
+    };
+    git3ready::rehearse::parse_git_version(&String::from_utf8_lossy(&out.stdout))
+        .is_some_and(|v| v >= (major, minor))
+}
+
+#[test]
+fn env_ignores_repository_local_init_defaults_and_fails_on_bad_config() {
+    if !git_at_least(2, 47) {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    assert!(git(d.path(), &["init", "-q", "p"]).status.success());
+    let p = d.path().join("p");
+    assert!(git(&p, &["config", "init.defaultBranch", "foo"])
+        .status
+        .success());
+    let run = |extra_env: &[(&str, &str)]| {
+        let mut c = bin();
+        c.current_dir(&p)
+            .args(["env", "--json"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_DIR");
+        for (k, v) in extra_env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let ok = run(&[]);
+    let v = parse(&ok);
+    let branch = v
+        .get("checks")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|c| c.get("subject").and_then(Value::as_str) == Some("init.defaultBranch"))
+        .and_then(|c| c.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    assert_eq!(branch.as_deref(), Some("risk"), "{}", stdout(&ok));
+
+    let bad = run(&[("GIT_CONFIG_COUNT", "not-a-count")]);
+    assert_eq!(bad.status.code(), Some(2), "{}", stdout(&bad));
+}
+
+#[test]
+fn scan_reads_non_utf8_scripts() {
+    let d = tempfile::tempdir().unwrap();
+    fs::write(
+        d.path().join("latin1.sh"),
+        b"# caf\xe9\ncat .git/HEAD\n".as_slice(),
+    )
+    .unwrap();
+    let out = bin()
+        .args(["scan", "--json"])
+        .arg(d.path())
+        .output()
+        .unwrap();
+    let v = parse(&out);
+    assert!(findings(&v).contains(&("head-file-read".into(), "latin1.sh".into())));
+    assert_eq!(
+        v.get("summary").and_then(|s| s.get("lossy_utf8")),
+        Some(&Value::Number(1.0))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_files_make_the_scan_incomplete() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("secret.sh");
+    fs::write(&p, "echo hi\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads anything; the check is meaningless there.
+    if fs::read(&p).is_ok() {
+        return;
+    }
+    let out = bin().arg("scan").arg(d.path()).output().unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(stdout(&out).contains("secret.sh"));
+}
+
+#[test]
+fn print_env_refuses_an_overriding_variable() {
+    if !git_at_least(2, 47) {
+        return;
+    }
+    let out = bin()
+        .args(["rehearse", "--print", "env"])
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_DEFAULT_HASH", "sha1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stdout(&out).is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("GIT_DEFAULT_HASH"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rehearse_passes_non_utf8_arguments() {
+    use std::os::unix::ffi::OsStrExt;
+    let arg = std::ffi::OsStr::from_bytes(b"x\xff");
+    let out = bin()
+        .args([
+            "rehearse",
+            "-q",
+            "--without",
+            "object-format",
+            "--without",
+            "ref-format",
+            "--",
+            "printf",
+            "%s",
+        ])
+        .arg(arg)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"x\xff");
 }

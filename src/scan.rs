@@ -32,9 +32,9 @@ pub const IGNORE_FILE: &str = ".git3readyignore";
 pub const SOURCE_EXTENSIONS: &[&str] = &[
     "bash", "bat", "c", "cc", "cfg", "cjs", "cmd", "conf", "cpp", "cs", "cts", "dart", "ex", "exs",
     "fish", "go", "gradle", "groovy", "h", "hcl", "hpp", "ini", "java", "js", "json", "jsonc",
-    "jsx", "kt", "kts", "lua", "md", "mdx", "mjs", "mk", "mts", "nix", "php", "pl", "pm", "ps1",
-    "psm1", "py", "rake", "rb", "rs", "scala", "sh", "sql", "swift", "tf", "toml", "ts", "tsx",
-    "txt", "vue", "xml", "yaml", "yml", "zsh",
+    "jsx", "ksh", "kt", "kts", "lua", "md", "mdx", "mjs", "mk", "mts", "nix", "php", "pl", "pm",
+    "ps1", "psm1", "py", "rake", "rb", "rs", "scala", "sh", "sql", "swift", "tf", "toml", "ts",
+    "tsx", "txt", "vue", "xml", "yaml", "yml", "zsh",
 ];
 
 /// Extensionless (or dot-) files scanned by default.
@@ -67,13 +67,16 @@ pub struct ScanOptions {
 }
 
 /// Counts of what the walk saw and skipped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanStats {
     pub scanned: usize,
+    /// Scanned files that were not valid UTF-8 and were read lossily.
+    pub lossy: usize,
+    /// Paths that could not be read; the scan is incomplete when non-empty.
+    pub unreadable: Vec<String>,
     pub skipped_kind: usize,
     pub skipped_large: usize,
     pub skipped_binary: usize,
-    pub skipped_unreadable: usize,
     pub suppressed: usize,
 }
 
@@ -81,12 +84,21 @@ pub struct ScanStats {
 pub type PathFindings = Vec<(String, Vec<Finding>)>;
 
 /// True when a path is one of the default source kinds by name alone.
+/// Names and extensions compare case-insensitively (`build.dockerfile`,
+/// `RUN.SH` on a case-insensitive filesystem).
 pub fn looks_like_source(rel_path: &str) -> bool {
-    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    if SOURCE_FILENAMES.contains(&name) {
+    let name = rel_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(rel_path)
+        .to_ascii_lowercase();
+    if SOURCE_FILENAMES
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(&name))
+    {
         return true;
     }
-    if name.starts_with("Dockerfile") || name.ends_with(".Dockerfile") {
+    if name.starts_with("dockerfile") || name.ends_with(".dockerfile") {
         return true;
     }
     match name.rsplit_once('.') {
@@ -94,6 +106,14 @@ pub fn looks_like_source(rel_path: &str) -> bool {
         Some((stem, ext)) if !stem.is_empty() => SOURCE_EXTENSIONS.contains(&ext),
         _ => false,
     }
+}
+
+/// A `#!` line, allowing for a UTF-8 byte order mark in front of it.
+fn starts_with_shebang(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(bytes)
+        .starts_with(b"#!")
 }
 
 fn has_extension(rel_path: &str) -> bool {
@@ -171,10 +191,14 @@ pub fn scan_tree(
     let check_bare = matcher.is_enabled("embedded-bare-repo");
 
     for result in walker.build() {
-        let Ok(dent) = result else {
-            // An unreadable directory is noted, not fatal.
-            stats.skipped_unreadable += 1;
-            continue;
+        let dent = match result {
+            Ok(d) => d,
+            // An unreadable directory does not stop the walk, but it is
+            // reported by path and makes the scan incomplete.
+            Err(e) => {
+                stats.unreadable.push(e.to_string());
+                continue;
+            }
         };
         let path = dent.path();
         let rel = path
@@ -218,16 +242,19 @@ pub fn scan_tree(
                 continue;
             }
             Ok(_) => {}
-            Err(_) => {
-                stats.skipped_unreadable += 1;
+            Err(e) => {
+                stats.unreadable.push(format!("{rel}: {e}"));
                 continue;
             }
         }
-        let Ok(bytes) = std::fs::read(path) else {
-            stats.skipped_unreadable += 1;
-            continue;
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                stats.unreadable.push(format!("{rel}: {e}"));
+                continue;
+            }
         };
-        if !by_name && !bytes.starts_with(b"#!") {
+        if !by_name && !starts_with_shebang(&bytes) {
             stats.skipped_kind += 1;
             continue;
         }
@@ -235,13 +262,19 @@ pub fn scan_tree(
             stats.skipped_binary += 1;
             continue;
         }
-        let Ok(text) = String::from_utf8(bytes) else {
-            stats.skipped_binary += 1;
-            continue;
+        // Every pattern is ASCII, so a script with a Latin-1 or CP932 comment
+        // is still worth reading; the odd bytes become U+FFFD.
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                stats.lossy += 1;
+                String::from_utf8_lossy(e.as_bytes()).into_owned()
+            }
         };
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
 
         stats.scanned += 1;
-        let scan = matcher.scan(&text);
+        let scan = matcher.scan(text);
         stats.suppressed += scan.suppressed;
         if !scan.findings.is_empty() {
             out.push((rel, scan.findings));
@@ -267,6 +300,9 @@ mod tests {
             ".gitconfig",
             "src/lib.rs",
             "build.Dockerfile",
+            "build.dockerfile",
+            "RUN.SH",
+            "x.ksh",
         ] {
             assert!(looks_like_source(yes), "{yes} should be scanned");
         }
@@ -286,6 +322,13 @@ mod tests {
         assert!(has_extension("a/b.txt"));
         assert!(!has_extension("hooks/pre-push"));
         assert!(!has_extension(".profile"));
+    }
+
+    #[test]
+    fn shebang_detection_allows_a_bom() {
+        assert!(starts_with_shebang(b"#!/bin/sh\n"));
+        assert!(starts_with_shebang(b"\xef\xbb\xbf#!/bin/sh\n"));
+        assert!(!starts_with_shebang(b"echo\n"));
     }
 
     #[test]

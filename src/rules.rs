@@ -93,7 +93,9 @@ impl Category {
                 "safe.bareRepository defaults to explicit: implicitly discovered bare repositories are refused."
             }
             Category::Removal => "Removed in Git 3.0.",
-            Category::Build => "Building Git requires Rust.",
+            Category::Build => {
+                "Rust is planned to become a required part of building Git (the document allows deferring this)."
+            }
         }
     }
 }
@@ -184,11 +186,11 @@ pub const RULES: &[Rule] = &[
     // -- safe.bareRepository ------------------------------------------------
     Rule {
         id: "embedded-bare-repo",
-        severity: Severity::Break,
+        severity: Severity::Risk,
         category: Category::SafeBareRepository,
         title: "Bare repository checked into the tree",
-        why: "Running Git inside this directory relies on implicit bare-repository discovery, which Git 3.0 refuses by default.",
-        fix: "Point Git at it explicitly (--git-dir or GIT_DIR), or create the fixture at test time instead of committing it.",
+        why: "Running Git from inside this directory (cd, git -C) relies on implicit bare-repository discovery, which Git 3.0 refuses by default. Using it as a clone, fetch or push URL keeps working.",
+        fix: "Point Git at it explicitly (--git-dir or GIT_DIR) wherever a command runs inside it, or create the fixture at test time.",
     },
     Rule {
         id: "bare-repo-implicit",
@@ -261,7 +263,7 @@ pub const RULES: &[Rule] = &[
         severity: Severity::Info,
         category: Category::Build,
         title: "Builds Git from source",
-        why: "Rust becomes a mandatory part of Git's build in 3.0, and the switch to turn it off goes away.",
+        why: "Git plans to make Rust mandatory in 3.0 and drop the build switch that turns it off; the document says this may be deferred if distributions are hurt.",
         fix: "Make sure the build image has a Rust toolchain before it builds Git 3.0.",
     },
 ];
