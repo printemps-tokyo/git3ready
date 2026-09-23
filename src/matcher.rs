@@ -80,6 +80,7 @@ pub struct Matcher {
     branch_rename: Regex,
     branch_rename_list: Regex,
     command_separator: Regex,
+    config_read: Regex,
     message_subcommand: Regex,
     message_arg: Regex,
     master: Regex,
@@ -245,22 +246,28 @@ impl Matcher {
             // Renaming or creating master after init: from here on master is
             // a branch the file chose, not the default.
             branch_reset: re(
-                r#"(?:\bcheckout\s+-[bB]|\bswitch\s+(?:-[cC]|--create|--force-create)|\bsymbolic-ref\s+HEAD)\s+(?:refs/heads/)?master(?:\s|$)|["']-[bBcC]["']\s*,\s*["']master["']|\bsymbolic[-_]ref\b.*["']refs/heads/master["']"#,
+                r#"(?:\bcheckout\s+-[bB]|\bswitch\s+(?:-[cC]|--create|--force-create)|\bsymbolic-ref\s+HEAD)\s+(?:refs/heads/)?master(?:\s|$)|["'](?:checkout|switch)["'].*["']-[bBcC]["']\s*,\s*["']master["']|\bsymbolic[-_]ref\b.*["']refs/heads/master["']"#,
             ),
             // git branch -m/-M [<old>] <new>: only a rename *to* master makes
             // it, and `branch -m master main` needs master to exist.
-            // Flags may sit around -m/-M (-f, --force, --move is -m); names
-            // may be quoted and the command may be followed by a quote,
-            // bracket or comment. Captures: first name, optional second.
+            // Flags may sit around -m/-M (-f, --force, --move is -m); the
+            // first name may be any token ("$cur", $(...)), the second a
+            // plain name; the command may be followed by a quote, bracket or
+            // comment. Captures: first token, optional second name.
             branch_rename: re(
-                r#"\bbranch(?:\s+(?:-f|--force))*\s+(?:-[mM]|--move|-f[mM]|-[mM]f)(?:\s+(?:-f|--force))*\s+["']?([\w./][\w./-]*)["']?(?:\s+["']?([\w./][\w./-]*)["']?)?(?:[\s"')\]#;]|$)"#,
+                r#"\bbranch(?:\s+(?:-f|--force))*\s+(?:-[mM]|--move|-f[mM]|-[mM]f)(?:\s+(?:-f|--force))*\s+("[^"]*"|'[^']*'|[^\s"')\]#;]+)(?:\s+["']?([\w./][\w./-]*)["']?)?(?:[\s"')\]#;]|$)"#,
             ),
             // The same in an argument list: ["branch", "-M", "master"] or
-            // ["branch", "-m", "old", "master"].
+            // ["branch", "-m", "old", "master"]. The subcommand must be
+            // branch: diff -M is rename detection.
             branch_rename_list: re(
-                r#"["'](?:-[mM]|--move)["']\s*,\s*["']([^"']+)["'](?:\s*,\s*["']([^"']+)["'])?"#,
+                r#"["']branch["'].*["'](?:-[mM]|--move)["']\s*,\s*(["'][^"']+["']|[\w.$]+)(?:\s*,\s*["']([^"']+)["'])?"#,
             ),
             command_separator: re(r"&&|\|\||;|\|"),
+            // Reading or removing the setting pins nothing.
+            config_read: re(
+                r"\bconfig\b.*(?:--get\b|--get-all\b|--get-regexp\b|--unset\b|--unset-all\b|--list\b|\s-l\b|\s(?:get|unset|list)\s)",
+            ),
             message_subcommand: re(
                 r"\b(?:commit|merge|tag|stash|notes|revert|cherry-pick|am|branch)\b",
             ),
@@ -521,7 +528,10 @@ impl Matcher {
             return true;
         }
         let renames_to_master = |c: regex::Captures| {
-            let first = c.get(1).map_or("", |m| m.as_str());
+            let first = c
+                .get(1)
+                .map_or("", |m| m.as_str())
+                .trim_matches(|ch| ch == '"' || ch == '\'');
             match c.get(2) {
                 Some(target) => target.as_str() == "master" && first != "master",
                 None => first == "master",
@@ -557,7 +567,7 @@ impl Matcher {
             if Self::is_comment(lines, idx) {
                 continue;
             }
-            if self.branch_pinned_file.is_match(line) {
+            if self.branch_pinned_file.is_match(line) && !self.config_read.is_match(line) {
                 return;
             }
             let blanked = self.blank_messages(line);
@@ -1101,6 +1111,42 @@ mod tests {
         // An argument list broken across lines.
         assert!(has(
             "subprocess.run([\"git\",\n                \"init\"])\nsubprocess.run([\"git\", \"checkout\", \"master\"])\n",
+            "master-after-init"
+        ));
+    }
+
+    #[test]
+    fn list_forms_need_their_subcommand() {
+        assert!(has(
+            "run([\"git\", \"init\"])\nrun([\"git\", \"diff\", \"-M\", \"master\"])\nrun([\"git\", \"log\", \"master\"])\n",
+            "master-after-init"
+        ));
+        assert!(!has(
+            "run([\"git\", \"init\"])\nrun([\"git\", \"checkout\", \"-b\", \"master\"])\nrun([\"git\", \"log\", \"master\"])\n",
+            "master-after-init"
+        ));
+    }
+
+    #[test]
+    fn master_after_init_round_four() {
+        for text in [
+            "git init r\ncur=$(git -C r symbolic-ref --short HEAD)\ngit -C r branch -m \"$cur\" master\ngit -C r log master\n",
+            "git init r\ngit -C r branch -m $cur master\ngit -C r log master\n",
+            "git init r\ngit -C r branch -m \"$(git -C r branch --show-current)\" master\ngit -C r log master\n",
+            "run([\"git\", \"init\"])\nrun([\"git\", \"branch\", \"-m\", old, \"master\"])\nrun([\"git\", \"log\", \"master\"])\n",
+        ] {
+            assert!(!has(text, "master-after-init"), "{text}");
+        }
+        for text in [
+            "git config --get init.defaultBranch 2>/dev/null\ngit init r\ngit -C r checkout master\n",
+            "git config --global --unset init.defaultBranch 2>/dev/null\ngit init r\ngit -C r checkout master\n",
+            "git config --get-all init.defaultBranch 2>&1\ngit init r\ngit -C r checkout master\n",
+            "git config get init.defaultBranch\ngit init r\ngit -C r checkout master\n",
+        ] {
+            assert!(has(text, "master-after-init"), "{text}");
+        }
+        assert!(!has(
+            "git config --global init.defaultBranch main 2>/dev/null\ngit init r\ngit -C r checkout master\n",
             "master-after-init"
         ));
     }
