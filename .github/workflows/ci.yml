@@ -35,3 +35,12 @@ jobs:
       - run: ./target/release/git3ready scan . --fail-on info --no-color
       # Dogfood: the test suite also has to pass under the Git 3.0 defaults.
       - run: ./target/release/git3ready rehearse -- cargo test --all
+
+  # The oldest Rust this crate promises to build with (rust-version in
+  # Cargo.toml). A dependency update that needs a newer one fails here.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo test --locked --all
