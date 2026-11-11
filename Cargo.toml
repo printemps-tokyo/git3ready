@@ -1,6 +1,6 @@
 [package]
 name = "git3ready"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Find the scripts, hooks, CI steps and code that assume Git 2.x defaults Git 3.0 changes (SHA-256 object ids, reftable, main, safe.bareRepository, removed commands), and rehearse your test suite under the new defaults. Offline Rust CLI."
