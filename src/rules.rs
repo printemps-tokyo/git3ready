@@ -11,14 +11,14 @@
 
 /// The document every rule is derived from.
 pub const SOURCE_URL: &str =
-    "https://github.com/git/git/blob/985b38ca6cdbd04432a7072c790f8ddf9dcc717c/Documentation/BreakingChanges.adoc";
+    "https://github.com/git/git/blob/53d995c53fb100920464c0709389f4fa55c6f215/Documentation/BreakingChanges.adoc";
 
 /// The git/git commit of [`SOURCE_URL`]: the latest change to that file when
 /// the rule table was last reviewed.
-pub const SOURCE_COMMIT: &str = "985b38ca6cdbd04432a7072c790f8ddf9dcc717c";
+pub const SOURCE_COMMIT: &str = "53d995c53fb100920464c0709389f4fa55c6f215";
 
 /// The day the document was read and the rule table reviewed against it.
-pub const SOURCE_READ_ON: &str = "2026-09-23";
+pub const SOURCE_READ_ON: &str = "2026-11-11";
 
 /// The source document's own words on timing, printed with every report.
 pub const NO_RELEASE_DATE: &str = "Git 3.0 has no planned release date.";

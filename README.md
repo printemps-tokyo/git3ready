@@ -24,7 +24,7 @@ cat: .git/refs/heads/.invalid: Not a directory
 ## Why
 
 Git keeps a list of the changes its next breaking release will make:
-[`Documentation/BreakingChanges.adoc`](https://github.com/git/git/blob/985b38ca6cdbd04432a7072c790f8ddf9dcc717c/Documentation/BreakingChanges.adoc).
+[`Documentation/BreakingChanges.adoc`](https://github.com/git/git/blob/53d995c53fb100920464c0709389f4fa55c6f215/Documentation/BreakingChanges.adoc).
 For Git 3.0 it says, among other things:
 
 - new repositories default to the `sha256` object format, so a full object id
@@ -118,13 +118,22 @@ set:
 | `default-branch` | `init.defaultBranch=main` |
 | `safe-bare-repository` | `safe.bareRepository=explicit` |
 
-`GIT_DEFAULT_HASH` and `GIT_DEFAULT_REF_FORMAT` override the config keys, so
-they are removed from the command's environment. The exit status is the
-command's own (127 if it cannot be started).
+`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT` and
+`GIT_DEFAULT_REF_STORAGE_FORMAT` override the config keys, so they are removed
+from the command's environment. The exit status is the command's own (127 if
+it cannot be started).
+
+`init.defaultRefFormat` is the name every Git since 2.47 reads. git/git commit
+[`53d995c`](https://github.com/git/git/commit/53d995c53fb100920464c0709389f4fa55c6f215)
+renamed it to `init.defaultRefStorageFormat`, which is the name
+`BreakingChanges.adoc` now uses, and kept the old name as a deprecated alias.
+No release up to v2.56.1 reads the new name, so `rehearse` keeps passing the
+old one; a parent `git -c` under either name is warned about.
 
 To apply the same environment in CI without wrapping each command
-(`--print env` refuses to run while `GIT_DEFAULT_HASH` or
-`GIT_DEFAULT_REF_FORMAT` is set, because `KEY=VALUE` lines cannot unset them):
+(`--print env` refuses to run while `GIT_DEFAULT_HASH`,
+`GIT_DEFAULT_REF_FORMAT` or `GIT_DEFAULT_REF_STORAGE_FORMAT` is set, because
+`KEY=VALUE` lines cannot unset them):
 
 ```yaml
 - run: git3ready rehearse --print env >> "$GITHUB_ENV"
@@ -170,6 +179,10 @@ reporting settings as unset. A `GIT_DEFAULT_HASH` / `GIT_DEFAULT_REF_FORMAT`
 value Git does not know (Git matches the names exactly) is reported as
 breaking `git init`; an unknown `init.default*Format` in config is reported
 as not pinning anything, since Git only warns and uses its default.
+The ref format default is also read under its newer names,
+`init.defaultRefStorageFormat` and `GIT_DEFAULT_REF_STORAGE_FORMAT`, but they
+count only when the installed Git is newer than 2.56: no release up to
+v2.56.1 reads them, so there `env` says the name is set and has no effect.
 
 ```console
 $ git3ready env
@@ -212,9 +225,16 @@ tooling.
 ## Where the facts come from
 
 - Every rule maps to one item of `BreakingChanges.adoc` at git/git commit
-  [`985b38c`](https://github.com/git/git/blob/985b38ca6cdbd04432a7072c790f8ddf9dcc717c/Documentation/BreakingChanges.adoc),
-  the latest change to that file when it was read on 2026-09-23. `git3ready
-  rules` and every report print that commit and date.
+  [`53d995c`](https://github.com/git/git/blob/53d995c53fb100920464c0709389f4fa55c6f215/Documentation/BreakingChanges.adoc),
+  the latest change to that file when it was read on 2026-11-11. `git3ready
+  rules` and every report print that commit and date. The rules were written
+  against `985b38c`; the only change since then renames the config key in the
+  reftable item from `init.defaultRefFormat` to `init.defaultRefStorageFormat`,
+  which adds or removes no item.
+- That rename, the deprecated alias, and `GIT_DEFAULT_REF_STORAGE_FORMAT`
+  taking precedence over `GIT_DEFAULT_REF_FORMAT` were read from
+  `Documentation/config/init.adoc` and `setup.c` at git/git `1891de4`
+  (master on 2026-11-09); `setup.c` at v2.56.1 has neither new name.
 - What a reftable repository looks like on disk (`.git/HEAD` reading
   `ref: refs/heads/.invalid`, `.git/refs/heads` being a file, no `.git/logs/`)
   and that `git -C` into a bare repository fails with

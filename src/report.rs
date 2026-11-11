@@ -413,7 +413,7 @@ mod tests {
         assert!(text.contains("a.sh:2:1"));
         assert!(text.contains("fx/remote.git/"));
         assert!(!text.contains("fx/remote.git/:0"));
-        assert!(text.contains("@ 985b38c"));
+        assert!(text.contains("@ 53d995c"));
         assert!(text.contains("no planned release date"));
         assert!(!text.contains('\x1b'));
     }

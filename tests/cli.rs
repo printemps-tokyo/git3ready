@@ -22,6 +22,7 @@ fn git(dir: &Path, args: &[&str]) -> Output {
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_DEFAULT_HASH")
         .env_remove("GIT_DEFAULT_REF_FORMAT")
+        .env_remove("GIT_DEFAULT_REF_STORAGE_FORMAT")
         .env_remove("GIT_DIR")
         .output()
         .expect("git runs")
@@ -132,7 +133,7 @@ fn scan_reports_each_kind_with_locations() {
         v.get("source")
             .and_then(|s| s.get("commit"))
             .and_then(Value::as_str),
-        Some("985b38ca6cdbd04432a7072c790f8ddf9dcc717c")
+        Some("53d995c53fb100920464c0709389f4fa55c6f215")
     );
 }
 
@@ -411,6 +412,48 @@ fn env_reports_removed_settings() {
     };
     assert_eq!(status("core.commentChar").as_deref(), Some("break"));
     assert_eq!(status("init.defaultBranch").as_deref(), Some("ok"));
+}
+
+#[test]
+fn env_reads_the_renamed_ref_format_key_only_where_git_does() {
+    if !have_git() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let global = d.path().join("gitconfig");
+    fs::write(&global, "[init]\n\tdefaultRefStorageFormat = files\n").unwrap();
+    let out = bin()
+        .current_dir(d.path())
+        .args(["env", "--json"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_DEFAULT_REF_FORMAT")
+        .env_remove("GIT_DEFAULT_REF_STORAGE_FORMAT")
+        .env_remove("GIT_DIR")
+        .output()
+        .unwrap();
+    let v = parse(&out);
+    let check = v
+        .get("checks")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|c| c.get("subject").and_then(Value::as_str) == Some("init.defaultRefFormat"))
+        .unwrap();
+    let status = check.get("status").and_then(Value::as_str).unwrap();
+    let detail = check.get("detail").and_then(Value::as_str).unwrap();
+    assert!(
+        detail.starts_with("init.defaultRefStorageFormat "),
+        "{detail}"
+    );
+    // No release up to 2.56 reads the new name (git/git setup.c at v2.56.1).
+    if git_at_least(2, 57) {
+        assert_eq!(status, "ok", "{detail}");
+    } else {
+        assert_eq!(status, "info", "{detail}");
+        assert!(detail.contains("does not read that name"), "{detail}");
+    }
 }
 
 fn git_at_least(major: u32, minor: u32) -> bool {

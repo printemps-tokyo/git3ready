@@ -21,6 +21,9 @@ pub struct Aspect {
     /// Name accepted by `--without`.
     pub name: &'static str,
     pub key: &'static str,
+    /// Other names Git reads the same setting from. A parent `git -c` that
+    /// uses one of them overrides the rehearsed value just like `key` does.
+    pub aliases: &'static [&'static str],
     pub value: &'static str,
     /// Environment variables that would override `key` and must be cleared.
     pub overriding_env: &'static [&'static str],
@@ -43,20 +46,29 @@ pub const ASPECTS: &[Aspect] = &[
     Aspect {
         name: "object-format",
         key: "init.defaultObjectFormat",
+        aliases: &[],
         value: "sha256",
         overriding_env: &["GIT_DEFAULT_HASH"],
         since: CONFIG_DEFAULT_FORMATS,
     },
     Aspect {
         name: "ref-format",
+        // git/git 53d995c renamed this key to init.defaultRefStorageFormat
+        // and kept this name as a deprecated alias (Documentation/config/
+        // init.adoc, setup.c). No release up to v2.56.1 reads the new name,
+        // so the old one is the only spelling every Git since 2.47 accepts.
+        // The same series added GIT_DEFAULT_REF_STORAGE_FORMAT, which that
+        // Git checks before GIT_DEFAULT_REF_FORMAT and before the config.
         key: "init.defaultRefFormat",
+        aliases: &["init.defaultRefStorageFormat"],
         value: "reftable",
-        overriding_env: &["GIT_DEFAULT_REF_FORMAT"],
+        overriding_env: &["GIT_DEFAULT_REF_STORAGE_FORMAT", "GIT_DEFAULT_REF_FORMAT"],
         since: CONFIG_DEFAULT_FORMATS,
     },
     Aspect {
         name: "default-branch",
         key: "init.defaultBranch",
+        aliases: &[],
         value: "main",
         overriding_env: &[],
         // Git 2.28.0's release notes: the default name used for the first
@@ -66,6 +78,7 @@ pub const ASPECTS: &[Aspect] = &[
     Aspect {
         name: "safe-bare-repository",
         key: "safe.bareRepository",
+        aliases: &[],
         value: "explicit",
         overriding_env: &[],
         // Git 2.38.0's release notes: "Introduce a safe.barerepository
@@ -145,15 +158,15 @@ pub fn plan(
         .to_ascii_lowercase();
     let warnings = aspects
         .iter()
+        .flat_map(|a| std::iter::once(&a.key).chain(a.aliases))
         // Both encodings Git accepts: 'key'='value' and the older 'key=value'.
-        .filter(|a| {
-            let key = a.key.to_ascii_lowercase();
+        .filter(|name| {
+            let key = name.to_ascii_lowercase();
             params.contains(&format!("'{key}'")) || params.contains(&format!("'{key}="))
         })
-        .map(|a| {
+        .map(|name| {
             format!(
-                "GIT_CONFIG_PARAMETERS (from a parent git -c) sets {} and overrides the rehearsed value",
-                a.key
+                "GIT_CONFIG_PARAMETERS (from a parent git -c) sets {name} and overrides the rehearsed value"
             )
         })
         .collect();
@@ -358,6 +371,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.warnings.len(), 1);
+    }
+
+    #[test]
+    fn renamed_ref_format_names_are_cleared_and_warned_about() {
+        let p = plan(
+            select(&[]).unwrap(),
+            env(&[
+                ("GIT_DEFAULT_REF_STORAGE_FORMAT", "files"),
+                (
+                    "GIT_CONFIG_PARAMETERS",
+                    "'init.defaultrefstorageformat'='files'",
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(p.unset, vec!["GIT_DEFAULT_REF_STORAGE_FORMAT".to_string()]);
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("init.defaultRefStorageFormat"));
+        // The injected key stays the name every Git since 2.47 reads.
+        assert!(p.set.iter().any(|(_, v)| v == "init.defaultRefFormat"));
+        assert!(!p
+            .set
+            .iter()
+            .any(|(_, v)| v == "init.defaultRefStorageFormat"));
     }
 
     #[test]

@@ -37,9 +37,15 @@ pub struct Facts {
     pub git_version: Option<String>,
     pub default_branch: Option<Setting>,
     pub default_object_format: Option<Setting>,
+    /// `init.defaultRefFormat`, the name every Git since 2.47 reads.
     pub default_ref_format: Option<Setting>,
+    /// The last value under either `init.defaultRefFormat` or its newer name
+    /// `init.defaultRefStorageFormat`, with the name that set it.
+    pub default_ref_format_any: Option<(String, Setting)>,
     pub env_default_hash: Option<String>,
     pub env_default_ref_format: Option<String>,
+    /// `GIT_DEFAULT_REF_STORAGE_FORMAT`, the newer name of the variable above.
+    pub env_default_ref_storage_format: Option<String>,
     pub env_git_dir: bool,
     pub env_graft_file: Option<String>,
     pub safe_bare_repository: Option<Setting>,
@@ -57,6 +63,14 @@ pub struct Check {
     pub detail: String,
     pub fix: Option<String>,
 }
+
+/// The newest Git release line that reads only `init.defaultRefFormat` and
+/// `GIT_DEFAULT_REF_FORMAT`. git/git 53d995c renamed the key to
+/// `init.defaultRefStorageFormat` (old name kept as a deprecated alias) and
+/// its series added `GIT_DEFAULT_REF_STORAGE_FORMAT`; `setup.c` at v2.56.1
+/// still has neither. A Git built from a later development snapshot that
+/// still calls itself 2.56 is judged as 2.56.
+const REF_FORMAT_OLD_NAMES_ONLY_UNTIL: (u32, u32) = (2, 56);
 
 /// The first Git with `git config --show-scope`.
 const SHOW_SCOPE_SINCE: (u32, u32) = (2, 26);
@@ -180,6 +194,48 @@ fn comment_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
     }
 }
 
+/// `init.defaultRefFormat` and `init.defaultRefStorageFormat` are one setting
+/// under two names in a Git that knows both (`read_default_format_config()`
+/// in git/git `setup.c`); whichever it reads last wins. Repository-local
+/// values are dropped for the reason given at [`user_config`].
+fn ref_format_config(cwd: &Path) -> Result<Option<(String, Setting)>, String> {
+    let out = git(
+        cwd,
+        &[
+            "config",
+            "--show-scope",
+            "--get-regexp",
+            r"^init\.defaultref(storage)?format$",
+        ],
+    )?;
+    match out.status.code() {
+        Some(0) if !reports_problem(&out.stderr) => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (scope, rest) = l.split_once('\t')?;
+                let (key, value) = rest.split_once(' ').unwrap_or((rest, ""));
+                let name = if key.eq_ignore_ascii_case("init.defaultrefstorageformat") {
+                    "init.defaultRefStorageFormat"
+                } else {
+                    "init.defaultRefFormat"
+                };
+                Some((
+                    name.to_string(),
+                    Setting {
+                        scope: scope.to_string(),
+                        value: value.to_string(),
+                    },
+                ))
+            })
+            .rfind(|(_, s)| !matches!(s.scope.as_str(), "local" | "worktree"))),
+        Some(1) if !reports_problem(&out.stderr) => Ok(None),
+        _ => Err(format!(
+            "git config init.defaultRefFormat failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
 /// Collect [`Facts`] by running Git in `cwd`.
 ///
 /// Fails when Git is missing or its configuration cannot be read; a partial
@@ -244,8 +300,10 @@ pub fn gather(cwd: &Path) -> Result<Facts, String> {
         default_branch: user_config(cwd, "init.defaultBranch")?,
         default_object_format: user_config(cwd, "init.defaultObjectFormat")?,
         default_ref_format: user_config(cwd, "init.defaultRefFormat")?,
+        default_ref_format_any: ref_format_config(cwd)?,
         env_default_hash: std::env::var("GIT_DEFAULT_HASH").ok(),
         env_default_ref_format: std::env::var("GIT_DEFAULT_REF_FORMAT").ok(),
+        env_default_ref_storage_format: std::env::var("GIT_DEFAULT_REF_STORAGE_FORMAT").ok(),
         env_git_dir: explicit_git_dir,
         env_graft_file: std::env::var("GIT_GRAFT_FILE")
             .ok()
@@ -293,15 +351,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         "sha1",
         "sha256",
     ));
-    out.push(format_default(
-        "init.defaultRefFormat",
-        f.env_default_ref_format
-            .as_deref()
-            .map(|v| ("GIT_DEFAULT_REF_FORMAT", v)),
-        f.default_ref_format.as_ref(),
-        "files",
-        "reftable",
-    ));
+    out.push(ref_format_default(f));
 
     out.push(match &f.safe_bare_repository {
         Some(s) if s.value == "explicit" => Check {
@@ -510,6 +560,74 @@ fn format_default(
     }
 }
 
+/// The ref format default, under the names the installed Git reads.
+///
+/// The subject and the suggested fix keep `init.defaultRefFormat`: it is the
+/// only name released Git reads, and Git with the rename still accepts it.
+fn ref_format_default(f: &Facts) -> Check {
+    const SUBJECT: &str = "init.defaultRefFormat";
+    // An unparsable version is treated as new: both names are honored.
+    let reads_new_names = f
+        .git_version
+        .as_deref()
+        .and_then(crate::rehearse::parse_git_version)
+        .is_none_or(|v| v > REF_FORMAT_OLD_NAMES_ONLY_UNTIL);
+    let old_env = f
+        .env_default_ref_format
+        .as_deref()
+        .map(|v| ("GIT_DEFAULT_REF_FORMAT", v));
+    if reads_new_names {
+        // GIT_DEFAULT_REF_STORAGE_FORMAT is checked before its deprecated
+        // equivalent (repository_format_configure() in git/git setup.c).
+        let env = f
+            .env_default_ref_storage_format
+            .as_deref()
+            .map(|v| ("GIT_DEFAULT_REF_STORAGE_FORMAT", v))
+            .or(old_env);
+        // `gather` fills both fields; the fallback covers facts that carry
+        // only the old name.
+        let setting = f
+            .default_ref_format_any
+            .as_ref()
+            .map(|(name, s)| (name.as_str(), s))
+            .or(f.default_ref_format.as_ref().map(|s| (SUBJECT, s)));
+        let mut check = format_default(SUBJECT, env, setting.map(|(_, s)| s), "files", "reftable");
+        if let (None, Some((name, _))) = (env, setting) {
+            if name != SUBJECT {
+                check.detail = format!("{name} {}", check.detail);
+                if let Some(fix) = &mut check.fix {
+                    *fix = fix.replace(SUBJECT, name);
+                }
+            }
+        }
+        return check;
+    }
+    let mut check = format_default(
+        SUBJECT,
+        old_env,
+        f.default_ref_format.as_ref(),
+        "files",
+        "reftable",
+    );
+    // Set only under a name this Git does not read: say so instead of
+    // reporting a plain "unset".
+    if old_env.is_none() && f.default_ref_format.is_none() {
+        let ignored = if f.env_default_ref_storage_format.is_some() {
+            Some("GIT_DEFAULT_REF_STORAGE_FORMAT")
+        } else {
+            f.default_ref_format_any.as_ref().map(|(n, _)| n.as_str())
+        };
+        if let Some(name) = ignored {
+            let (maj, min) = REF_FORMAT_OLD_NAMES_ONLY_UNTIL;
+            check.detail = format!(
+                "{name} is set, but Git up to {maj}.{min} does not read that name, so this is {}",
+                check.detail
+            );
+        }
+    }
+    check
+}
+
 /// Exit status for `env`: 1 when any check is at `fail_on` or worse.
 pub fn exit_code(checks: &[Check], fail_on: Severity) -> i32 {
     i32::from(
@@ -710,6 +828,68 @@ mod tests {
         assert_eq!(
             status_of(&checks, "init.defaultRefFormat"),
             Some(Some(Severity::Risk))
+        );
+    }
+
+    #[test]
+    fn renamed_ref_format_names_depend_on_the_git_version() {
+        let new_names = Facts {
+            default_ref_format_any: Some((
+                "init.defaultRefStorageFormat".into(),
+                set("global", "files").unwrap(),
+            )),
+            ..Default::default()
+        };
+        // A Git that reads only the old names: the setting has no effect.
+        let old_git = Facts {
+            git_version: Some("git version 2.56.1".into()),
+            ..new_names.clone()
+        };
+        let checks = evaluate(&old_git);
+        let c = checks
+            .iter()
+            .find(|c| c.subject == "init.defaultRefFormat")
+            .unwrap();
+        assert_eq!(c.status, Some(Severity::Info));
+        assert!(c
+            .detail
+            .starts_with("init.defaultRefStorageFormat is set, but"));
+        assert!(c.detail.contains("unset"));
+        // A Git with the rename: the new name pins the format.
+        let new_git = Facts {
+            git_version: Some("git version 2.57.0".into()),
+            ..new_names
+        };
+        let checks = evaluate(&new_git);
+        let c = checks
+            .iter()
+            .find(|c| c.subject == "init.defaultRefFormat")
+            .unwrap();
+        assert_eq!(c.status, None);
+        assert!(c
+            .detail
+            .starts_with("init.defaultRefStorageFormat set to files"));
+
+        // The new variable wins over the old one, but only where it is read.
+        let both_env = Facts {
+            env_default_ref_format: Some("files".into()),
+            env_default_ref_storage_format: Some("reftable".into()),
+            ..Default::default()
+        };
+        let detail_for = |version: &str| {
+            let f = Facts {
+                git_version: Some(version.into()),
+                ..both_env.clone()
+            };
+            evaluate(&f)
+                .into_iter()
+                .find(|c| c.subject == "init.defaultRefFormat")
+                .unwrap()
+                .detail
+        };
+        assert!(detail_for("git version 2.52.0").contains("GIT_DEFAULT_REF_FORMAT=files"));
+        assert!(
+            detail_for("git version 2.57.0").contains("GIT_DEFAULT_REF_STORAGE_FORMAT=reftable")
         );
     }
 

@@ -124,7 +124,10 @@ Aspects: object-format (init.defaultObjectFormat=sha256), ref-format
 (init.defaultRefFormat=reftable), default-branch (init.defaultBranch=main),
 safe-bare-repository (safe.bareRepository=explicit). They are passed through
 GIT_CONFIG_COUNT, after any pairs already set, and GIT_DEFAULT_HASH /
-GIT_DEFAULT_REF_FORMAT are cleared because they would override them.
+GIT_DEFAULT_REF_FORMAT / GIT_DEFAULT_REF_STORAGE_FORMAT are cleared because
+they would override them. init.defaultRefFormat is the name released Git
+reads; Git's development branch renamed it to init.defaultRefStorageFormat
+and keeps the old name as an alias.
 
 Not rehearsed: removed commands still exist in the installed Git, clones keep
 their remote's format, and an explicit `git -c` wins over the environment.")]
